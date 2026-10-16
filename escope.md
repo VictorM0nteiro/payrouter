@@ -124,7 +124,7 @@ Uma `PaymentInstruction`. Toda a complexidade do projeto cabe no ciclo de vida d
              ▼           ▼          ▼
           settled    rejected    unknown
                                     │
-                         consulta de status
+              consulta de status (StatusQueried, registra)
                        ┌────────────┼────────────┐
                        ▼            ▼            ▼
                    settled      rejected      unknown
@@ -150,15 +150,21 @@ configurado, e o evento registra isso.
 |---|---|---|
 | `InstructionAccepted` | Validada e persistida, nada enviado | → `accepted` |
 | `RoutingAttempted` | Mensagem despachada ao participante | → `in_flight` |
-| `ParticipantAccepted` | Participante confirmou | → `settled` |
-| `ParticipantRejected` | Participante negou, com código | → `rejected` |
+| `ParticipantAccepted` | Participante confirmou (na resposta ou descoberto na conciliação) | `in_flight` ou `unknown` → `settled` |
+| `ParticipantRejected` | Participante negou, com código (idem) | `in_flight` ou `unknown` → `rejected` |
 | `RoutingTimedOut` | Sem resposta no prazo | → `unknown` |
-| `StatusQueried` | Consulta de conciliação feita, com o resultado | permanece ou resolve |
+| `StatusQueried` | Consulta de conciliação feita, com o resultado | `unknown` → `unknown` (só registra) |
 | `RoutingThrottled` | Participante devolveu `429`, nada foi processado | → `accepted` |
 | `ReconciliationExhausted` | N consultas sem conclusão | → `failed` |
 
 Oito eventos. Transição ilegal é rejeitada **no domínio**, com erro tipado — não por
 constraint de banco, não por `if` espalhado no handler.
+
+`StatusQueried` nunca muda o estado: registra a consulta e o que o participante
+respondeu. Quem resolve é `ParticipantAccepted` ou `ParticipantRejected`, emitido logo
+depois quando a consulta é conclusiva. São dois fatos separados ("consultei" e
+"resolvi"), o que mantém a conciliação auditável e bate com a linha do tempo do
+documento Mongo da seção 4.
 
 ---
 
