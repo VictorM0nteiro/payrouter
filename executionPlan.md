@@ -1,7 +1,7 @@
 # payrouter — Plano de execução
 
 > Companheiro do documento de escopo. O escopo define **o que** e **por quê**; este define
-> **quando** e **como**. 31 sessões de ~2h30, ou ~20 semanas a 4h por semana.
+> **quando** e **como**. 33 sessões de ~2h30, ou ~21 semanas a 4h por semana.
 
 ---
 
@@ -29,8 +29,10 @@ carga, formatação de relatório, rascunho de ADR a partir de decisão que **vo
   entrevista cobra e é a parte mais barata de escrever à mão.
 - **A idempotência do consumidor e o controle de concorrência otimista.** São os dois
   mecanismos centrais da tese.
+- **A afinidade por chave e o watermark de offset do worker pool.** É onde paralelismo
+  vira bug de ordem; o redimensionamento em si pode ser delegado, a invariante não.
 - **A decisão** de qualquer ADR. O Claude Code redige; a escolha é sua.
-- **A análise das três medições.** "Por que o lag cresce assim com 4 consumidores" é a
+- **A análise das quatro medições.** "Por que o lag cresce assim com 4 consumidores" é a
   pergunta de entrevista inteira.
 
 ### A regra de aceitação
@@ -66,6 +68,9 @@ isso só existe porque a fronteira é assíncrona?
 - Dinheiro é int64 de centavos. Nunca float, nem em log, nem em JSON.
 - Relay publica e DEPOIS marca published_at. At-least-once, assumido.
 - No limite de saída, backpressure (pausa a partição), nunca descarte.
+- Pools elásticos (`internal/elastic`) nunca executam dois eventos do mesmo aggregate_id
+  ao mesmo tempo nem fora de ordem; offset só avança até o watermark contíguo.
+  Pool nunca reenvia por conta própria: reduzir limite em timeout é controle de carga.
 - 429 do participante = não processado, reenviar é seguro.
   Timeout = não sei, a única operação segura é consultar status. Nunca confunda os dois.
 
@@ -86,8 +91,7 @@ Atualize a linha de estado ao fim de cada sessão.
 
 ## 2. Convenções
 
-**Branches.** Uma por sessão (`s01-dominio`, `s09-outbox`), PR para `main` ao fim. Não é
-cerimônia: é exercitar o gatilho `pull_request` do CI, como funciona em time.
+**Branches.** Trabalho solo: commits direto na `main`, sem PR. O CI roda no `push`.
 
 **Commits.** Imperativo, uma mudança lógica por commit.
 
@@ -109,7 +113,7 @@ mais comum em event sourcing e aparece em revisão.
 | Sessão | Entrega |
 |---|---|
 | 1 | Repo, CI com lint + `-race`, `CLAUDE.md`, migration 001 com as quatro tabelas |
-| 2 | Os sete eventos, `Money`, a máquina de estados, reconstrução do agregado, transições ilegais com erro tipado |
+| 2 | Os oito eventos, `Money`, a máquina de estados, reconstrução do agregado, transições ilegais com erro tipado |
 | 3 | Adapter Postgres: append com versão esperada, load do agregado, testcontainers |
 | 4 | Teste de concorrência otimista: N goroutines gravando a mesma versão, exatamente uma vence |
 
@@ -155,7 +159,7 @@ que o outbox existe para evitar — o evento tem que estar na mesma transação 
 
 ---
 
-### Fase D — o estado desconhecido (sessões 13-18)
+### Fase D — o estado desconhecido (sessões 13-20)
 
 O coração do projeto. Reserve fôlego: é a fase que mais vai render em entrevista e a que
 mais vai quebrar.
@@ -167,7 +171,9 @@ mais vai quebrar.
 | 15 | `ReconciliationExhausted` após N tentativas; **o teste do caso cruel**: participante responde depois do timeout e a conciliação descobre que a operação aconteceu |
 | 16 | Teste ponta a ponta dos seis comportamentos do participante |
 | 17 | Rate limit de saída: limitador antes do envio, `pause`/`resume` da partição, `RoutingThrottled` no `429`. Mais o token bucket de entrada portado do wallet-go |
-| 18 | Folga e dívida acumulada |
+| 18 | `internal/elastic.WorkerPool`: min/max, crescimento por fila e espera, encolhimento com histerese, afinidade por `aggregate_id`, watermark contíguo de offset. Testes unitários sem Kafka, sob `-race` |
+| 19 | Conexões elásticas para o participante: limitador AIMD de requisições em voo + `http.Transport` acompanhando o limite; integração do pool no processor |
+| 20 | Folga e dívida acumulada |
 
 **Pronto quando:** com o participante configurado para "processa mas não responde", a
 instrução passa por `unknown` e termina em `settled` sem nenhuma intervenção manual, e o
@@ -182,15 +188,15 @@ a melhor resposta curta que o projeto te dá.
 
 ---
 
-### Fase E — projeção (sessões 18-22)
+### Fase E — projeção (sessões 21-25)
 
 | Sessão | Entrega |
 |---|---|
-| 18 | `cmd/projector`: consumidor Kafka, projeção Mongo, idempotência por `version` |
-| 19 | Testes de reentrega do mesmo evento e de evento fora de ordem |
-| 20 | Redis: cache de status com versão; `GET /instructions?status=...` pela projeção |
-| 21 | Replay completo: comando que descarta a projeção e reconstrói do event store |
-| 22 | Folga |
+| 21 | `cmd/projector`: consumidor Kafka, projeção Mongo, idempotência por `version` |
+| 22 | Testes de reentrega do mesmo evento e de evento fora de ordem |
+| 23 | Redis: cache de status com versão; `GET /instructions?status=...` pela projeção |
+| 24 | Replay completo: comando que descarta a projeção e reconstrói do event store |
+| 25 | Folga |
 
 **Pronto quando:** você apaga a coleção do Mongo, roda `make replay`, e a projeção volta
 idêntica — sem nenhuma mensagem reenviada ao participante. Esse teste é a prova do ADR 2.
@@ -201,14 +207,14 @@ função pura dos eventos.
 
 ---
 
-### Fase F — observabilidade e medição (sessões 23-26)
+### Fase F — observabilidade e medição (sessões 26-29)
 
 | Sessão | Entrega |
 |---|---|
-| 23 | OTel: trace atravessando api → relay → Kafka → processor/projector; métricas de lag, tentativas e fila de conciliação |
-| 24 | Harness de carga, instrumentação do lag, seed determinístico |
-| 25 | Experimento 7.1: lag da projeção com 1, 2 e 4 consumidores, dois níveis de carga |
-| 26 | Experimentos 7.2 (replay com 10k/100k/1M) e 7.4 (saturação do participante). 7.3 só se sobrar tempo |
+| 26 | OTel: trace atravessando api → relay → Kafka → processor/projector; métricas de lag, tentativas e fila de conciliação |
+| 27 | Harness de carga, instrumentação do lag, seed determinístico |
+| 28 | Experimento 7.1: lag da projeção com 1, 2 e 4 consumidores, dois níveis de carga |
+| 29 | Experimentos 7.2 (replay com 10k/100k/1M) e 7.4 (saturação do participante, pool fixo contra elástico). 7.3 só se sobrar tempo |
 
 **Pronto quando:** `docs/bench/` tem os dados brutos e qualquer pessoa repete a execução a
 partir do que está escrito.
@@ -220,14 +226,14 @@ metade.
 
 ---
 
-### Fase G — falha induzida e documentação (sessões 27-30)
+### Fase G — falha induzida e documentação (sessões 30-33)
 
 | Sessão | Entrega |
 |---|---|
-| 27 | Roteiros 1-4: Kafka cai e volta, Mongo cai, processor morre no meio do roteamento, `kill -9` entre o append e o publish |
-| 28 | Roteiros 5-6 e `docs/resilience-report.md` com as hipóteses escritas antes |
-| 29 | `docs/performance-report.md` + os 8 ADRs |
-| 30 | README final, limitações conhecidas, folga |
+| 30 | Roteiros 1-4: Kafka cai e volta, Mongo cai, processor morre no meio do roteamento, `kill -9` entre o append e o publish |
+| 31 | Roteiros 5-6 e `docs/resilience-report.md` com as hipóteses escritas antes |
+| 32 | `docs/performance-report.md` + os 10 ADRs |
+| 33 | README final, limitações conhecidas, folga |
 
 **O protocolo, igual ao do projeto anterior:** cada falha vira uma hipótese escrita
 **antes**, o comportamento observado depois, e a divergência preservada no texto.
@@ -245,6 +251,7 @@ que o outbox existe para cobrir, e é onde você demonstra que a reentrega funci
 | **Máquina não aguenta a stack** (Postgres + Kafka + Mongo + Redis + 5 processos) | Swap, lentidão, número instável | Use **Redpanda** no lugar do Kafka para desenvolvimento e teste: compatível com o protocolo, sobe em ~1s contra ~20s, consome uma fração da memória. Mantenha Kafka real só na execução de medição |
 | Testcontainers com Kafka deixa a suíte lenta | Suíte acima de 3min | Container compartilhado por pacote, com tópico novo por teste; ou Redpanda |
 | Fase D estoura | Sessão 16 não fecha na semana 11 | Corte o `ReconciliationExhausted` com escalonamento e deixe só o limite de tentativas |
+| Pool elástico reordena ou perde mensagem ao redimensionar | Teste de propriedade falha: mesmo agregado fora de ordem, ou offset commitado à frente de mensagem em voo | Fixe o pool em tamanho constante, prove ordem e watermark, e só então ligue a elasticidade. Se não fechar, o experimento 7.4 compara apenas pools fixos e o limite fica declarado |
 | `pause`/`resume` de partição dá nó | Consumidor para e não volta, ou duplica | Comece limitando com token bucket antes do envio e só depois pause a partição. O limitador sozinho já evita estourar o participante; o pause é o que evita acumular na memória |
 | Medição ruidosa | Variação acima de 15% entre repetições | Mude o ambiente antes de aumentar repetições. A lição do wallet-go: gerador competindo com os serviços produz curva não-monotônica |
 | Processo seletivo abre antes da fase F | — | Pare na sessão 17, declare o estado no README, apresente assim. A tese já está provada |
@@ -252,7 +259,7 @@ que o outbox existe para cobrir, e é onde você demonstra que a reentrega funci
 
 ---
 
-## 5. As dez perguntas de defesa
+## 5. As onze perguntas de defesa
 
 Uma por semana, respondida em voz alta, cronometrada em dois minutos, com referência ao
 seu código. É a atividade que converte o projeto em aprovação.
@@ -267,6 +274,8 @@ seu código. É a atividade que converte o projeto em aprovação.
 8. Por que particionar por `aggregate_id` e não garantir ordem global?
 9. O participante devolveu `429` e, em outra instrução, deu timeout. Por que você trata as duas de formas opostas?
 10. A entrada chega a quatro vezes o que o participante aceita. O que o sistema faz, e o que ele não faz?
+
+11. O worker pool cresce de 2 para 20 goroutines no meio da carga. Como você garante que dois eventos do mesmo agregado não rodam juntos nem fora de ordem, e que nenhum offset é commitado antes da hora?
 
 A pergunta 1 é a que o projeto existe para responder. A 7 é a que você vai responder com
 um número medido, o que quase nenhum candidato consegue.
@@ -285,9 +294,10 @@ um número medido, o que quase nenhum candidato consegue.
 - [ ] `docker compose up` funciona em máquina limpa
 - [ ] Sob entrada acima do limite de saída, nada se perde e o consumidor recupera
 - [ ] Relatórios de medição com metodologia e ameaças à validade
-- [ ] 8 ADRs escritos
+- [ ] 10 ADRs escritos
 - [ ] Relatório de resiliência com pelo menos uma hipótese errada preservada
 - [ ] README com limitações conhecidas
-- [ ] Você responde as dez perguntas em voz alta, sem olhar, em dois minutos cada
+- [ ] Teste de propriedade do pool elástico: ordem por agregado e watermark preservados sob redimensionamento, `-race`, 20 execuções
+- [ ] Você responde as onze perguntas em voz alta, sem olhar, em dois minutos cada
 
 O último item é o único sem código associado e é o que decide a entrevista.

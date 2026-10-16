@@ -85,10 +85,12 @@ chutar; e medir o custo da consistência eventual em vez de afirmá-lo.
 - Projeção de documento em MongoDB, com consumidor idempotente
 - Cache de status em Redis
 - Replay completo de projeção
-- Observabilidade com OpenTelemetry e as três medições da seção 7
+- Observabilidade com OpenTelemetry e as quatro medições da seção 7
 - Participante simulado com comportamento configurável, incluindo mentir
 - Rate limit **de saída** para o participante, com backpressure no consumidor
 - Rate limit de entrada por cliente (portado do wallet-go, declarado como reaproveitamento)
+- **Worker pool elástico** no processor e **pool de conexões elástico** para o participante,
+  ambos preservando a ordem por `aggregate_id` (decisão 10)
 
 ### Fora (deliberadamente)
 
@@ -227,7 +229,8 @@ HAVING COUNT(*) <> MAX(version) OR MIN(version) <> 1;
 -- 2. Todo evento tem exatamente uma linha de outbox.
 SELECT e.id FROM events e
 LEFT JOIN outbox o ON o.event_id = e.id
-WHERE o.id IS NULL;
+GROUP BY e.id
+HAVING COUNT(o.id) <> 1;
 ```
 
 Ambas devem retornar zero linhas, sempre.
@@ -320,6 +323,29 @@ que parecem iguais no log e que não podem ser tratadas do mesmo jeito.
 O rate limit **de entrada** por cliente é o token bucket do wallet-go, portado. Fica
 declarado como reaproveitamento no README, porque não é contribuição deste projeto.
 
+**10. Concorrência elástica que nunca quebra a ordem por agregado.** O processor roteia
+em paralelo, mas dois eventos do mesmo `aggregate_id` jamais executam ao mesmo tempo nem
+fora de ordem. Isso só existe porque a fronteira é assíncrona: o paralelismo vem da
+chegada de mensagens independentes, e o limite vem do participante externo.
+
+- **Worker pool elástico** (`internal/elastic`, genérico): entre `min` e `max` goroutines,
+  cresce quando a fila interna e o tempo de espera sobem, encolhe com ociosidade, com
+  histerese para não oscilar. Despacho com afinidade por chave: o mesmo agregado cai
+  sempre na mesma lane enquanto tem trabalho em voo (mapa de chaves ativas), então
+  redimensionar o pool não reordena nada. O offset só avança até o **watermark
+  contíguo**: concluir a mensagem 7 antes da 5 não commita a 7.
+- **Pool de conexões elástico** para o participante: limite de requisições em voo
+  adaptativo (AIMD: aumento aditivo em sucesso, redução multiplicativa em timeout ou
+  `429`), mais `http.Transport` com `MaxConnsPerHost` acompanhando o limite atual.
+  Conexão ociosa é fechada após TTL. O teto é o rate limit de saída; o pool não o
+  substitui.
+- **Dimensionamento defensável (Lei de Little):** workers necessários ≈ TPS-alvo ×
+  latência p99 do participante. Medir isso, não chutar `max`.
+- **Postgres usa `pgxpool` estático**, dimensionado e medido. `pgxpool` não redimensiona
+  em runtime e reinventá-lo não agrega à tese; declarado como limitação.
+- Timeout ainda é "não sei": o pool nunca reenvia por conta própria. Redução do limite em
+  timeout é só controle de carga, e a instrução vai para `unknown` como sempre.
+
 ---
 
 ## 6. Arquitetura
@@ -372,6 +398,8 @@ internal/
   domain/         PaymentInstruction, eventos, máquina de estados, Money
                   — zero import de pgx, net/http, kafka, mongo
   app/            casos de uso + portas
+  elastic/        WorkerPool e ConnPool/limitador adaptativo, genéricos, sem
+                  dependência de Kafka ou HTTP — testáveis em isolamento
   adapters/
     http/         handlers, DTOs, erro de domínio → status
     postgres/     event store, outbox, tasks, idempotência
@@ -429,6 +457,13 @@ forma graciosa ou colapsa?
 |---|---|
 | Entrada | 50/s (no limite), 100/s, 200/s |
 | Limite de saída | fixo em 50/s |
+| Concorrência | pool fixo (1, 8, 32) contra pool elástico (min 1, max 32); rajada: 10s a 200/s entre períodos a 20/s |
+
+Registrar, além do abaixo: goroutines ativas ao longo do tempo, eventos de
+redimensionamento, p99 do roteamento e tempo até o pool encolher após a rajada. A
+hipótese a escrever antes: o elástico iguala o throughput do fixo grande com bem menos
+goroutines ociosas, ao custo de um pico de latência no início da rajada. Se o fixo grande
+ganhar sempre, a elasticidade não se justifica e o relatório diz isso.
 
 Registrar: crescimento da fila de conciliação, lag da projeção, latência do `POST`
 (precisa continuar respondendo rápido — ele só grava evento), e se o consumidor recupera
@@ -438,7 +473,7 @@ O resultado esperado é que o lag cresça de forma proporcional e nada se perca.
 coisa se perder, o backpressure está errado, e descobrir isso medindo é melhor que
 descobrir numa pergunta de entrevista.
 
-**Metodologia, para as três:** hardware, SO, versões, parâmetros, semente e comando exato
+**Metodologia, para as quatro:** hardware, SO, versões, parâmetros, semente e comando exato
 registrados. Reprodutibilidade é metade da credibilidade; a outra metade é explicar *por
 que* o número é o que é.
 
@@ -463,6 +498,7 @@ Arquivos curtos em `docs/adr/`: contexto, opções consideradas, decisão, conse
 | 7 | Leitura de agregado autoritativa, lista eventual | Dissolve read-your-writes sem máquina extra; o contrato fica honesto |
 | 8 | At-least-once em vez de at-most-once | Publicar antes de marcar. A alternativa perde evento, que é pior que duplicar |
 | 9 | Backpressure em vez de descarte no limite de saída | Instrução de pagamento não se descarta: ela espera. E por que `429` e timeout, que parecem a mesma falha, exigem reações opostas |
+| 10 | Pools elásticos com serialização por agregado | Paralelismo sem quebrar a ordem: afinidade por chave + watermark de offset. Por que `pgxpool` ficou estático. Quando elasticidade não compensa |
 
 ADR 5 é o mais valioso. É o único que não tem resposta limpa, e é por isso que ele mostra
 julgamento em vez de conhecimento.
@@ -537,8 +573,38 @@ A primeira sessão produz, nesta ordem:
 1. Repositório, estrutura de pastas, CI com lint e teste rodando desde o primeiro commit
 2. `CLAUDE.md` com as regras invioláveis
 3. Migration 001 com `events`, `outbox`, `reconciliation_tasks` e `idempotency_keys`
-4. A máquina de estados no domínio, com os sete eventos e seus testes — **sem banco, sem
+4. A máquina de estados no domínio, com os oito eventos e seus testes — **sem banco, sem
    Kafka, sem nada**
 
 Comece pelo domínio. A máquina de estados é a única parte do sistema que você precisa
 saber de cor para defender o projeto falando, e é a mais barata de construir.
+---
+
+## 13. Cobertura das vagas-alvo
+
+O projeto existe para capacitar para duas vagas: Software Engineer no Mercado Livre
+(Go + React + IA) e Pix na Stone (Go, Kafka, Postgres, event-driven). O mapeamento
+abaixo é honesto: o que o escopo cobre, o que cobre só na fila de extras e o que fica
+**deliberadamente de fora** (a regra de escopo manda aprofundar, não alargar).
+
+| Requisito das vagas | Onde está no projeto | Status |
+|---|---|---|
+| Go: APIs, concorrência, testes | todo o projeto; concorrência otimista (S4); worker pool e pool de conexões elásticos (S18-19) | Coberto |
+| Microsserviços, sistemas assíncronos, mensageria (Kafka) | 5 processos, outbox, relay, consumidores | Coberto |
+| Event Sourcing, Arquitetura Hexagonal | agregado event-sourced, `internal/` hexagonal | Coberto |
+| CQRS | comando (Postgres) separado da leitura de lista (Mongo/Redis) | Coberto (ADR 7) |
+| Lambda Architecture | replay + projeção incremental | Extra 1 (§11) |
+| PostgreSQL / relacional | event store, outbox, tasks | Coberto (MySQL não; mesma família, declarar) |
+| NoSQL: MongoDB, Redis | projeção e cache | Coberto |
+| Elasticsearch | terceira projeção | Extra 5 (§11) |
+| Observabilidade (OTel, Prometheus, Grafana) | Fase F | Coberto (New Relic/Datadog: OTel exporta para ambos) |
+| Testes automatizados, CI | testcontainers, `-race`, GitHub Actions | Coberto (Azure DevOps não; pipeline equivalente) |
+| Resiliência, mercado financeiro, pagamentos | tese inteira: `unknown`, conciliação | Coberto |
+| Cloud (AWS/GCP) | Extras 3 e 4 (§11) | Extra |
+| React/TypeScript | — | **Fora** (§2 exclui frontend) |
+| IA: agentes, MCP, tools, function calling | — | **Fora** |
+
+React e IA são requisitos centrais só da vaga do Mercado Livre e são outro projeto, não
+uma feature deste. Se for perseguir essa vaga, o caminho natural é um projeto pequeno
+à parte (um MCP Server em Go expondo `GET /instructions` e a consulta de status como
+tools), depois deste. Isso é decisão sua; nada aqui o inclui.
