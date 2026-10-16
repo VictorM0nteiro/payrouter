@@ -75,8 +75,9 @@ func (p *PaymentInstruction) Status() Status    { return p.status }
 func (p *PaymentInstruction) Amount() Money     { return p.amount }
 func (p *PaymentInstruction) Attempts() int     { return p.attempts }
 
-// Version é a versão do último evento aplicado. O adapter a usa como versão esperada ao
-// gravar o próximo evento (concorrência otimista).
+// Version é a versão do último evento aplicado. Para usá-la como versão esperada no
+// Append, leia-a ANTES de executar o comando: os comandos aplicam o evento no próprio
+// agregado, então depois deles Version() já é a versão nova.
 func (p *PaymentInstruction) Version() int { return p.version }
 
 // apply muta o estado. Não valida: quem chama já validou a transição. Por isso nunca

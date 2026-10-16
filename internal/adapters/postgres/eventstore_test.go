@@ -63,7 +63,14 @@ func startPostgres(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	testPool, err = pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return err
+	}
+	// Pool maior que o número de concorrentes dos testes da sessão 4, para que a disputa
+	// seja no banco e não na fila por conexão.
+	cfg.MaxConns = 64
+	testPool, err = pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return err
 	}
