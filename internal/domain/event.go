@@ -50,3 +50,34 @@ type InstructionAccepted struct {
 	Creditor   string
 	EndToEndID string
 }
+
+// RoutingAttempted: mensagem despachada ao participante.
+type RoutingAttempted struct{}
+
+// ParticipantAccepted: o participante confirmou, na resposta ou descoberto na conciliação.
+type ParticipantAccepted struct{}
+
+// ParticipantRejected: o participante negou, com o código informado por ele.
+type ParticipantRejected struct{ Code string }
+
+// RoutingTimedOut: sem resposta no prazo. Não se sabe se o participante processou.
+type RoutingTimedOut struct{}
+
+// StatusQueried: consulta de conciliação feita. Só registra o resultado, nunca muda o
+// estado; quem resolve é ParticipantAccepted ou ParticipantRejected.
+type StatusQueried struct{ Result QueryResult }
+
+// RoutingThrottled: o participante devolveu 429. Definitivamente não processado.
+type RoutingThrottled struct{}
+
+// ReconciliationExhausted: N consultas sem conclusão. Attempts é quantas foram feitas.
+type ReconciliationExhausted struct{ Attempts int }
+
+func (InstructionAccepted) Type() EventType     { return EventInstructionAccepted }
+func (RoutingAttempted) Type() EventType        { return EventRoutingAttempted }
+func (ParticipantAccepted) Type() EventType     { return EventParticipantAccepted }
+func (ParticipantRejected) Type() EventType     { return EventParticipantRejected }
+func (RoutingTimedOut) Type() EventType         { return EventRoutingTimedOut }
+func (StatusQueried) Type() EventType           { return EventStatusQueried }
+func (RoutingThrottled) Type() EventType        { return EventRoutingThrottled }
+func (ReconciliationExhausted) Type() EventType { return EventReconciliationExhausted }

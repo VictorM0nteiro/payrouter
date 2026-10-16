@@ -28,5 +28,3 @@ type ErrIllegalTransition struct {
 func (e ErrIllegalTransition) Error() string {
 	return fmt.Sprintf("transição ilegal: evento %s não é permitido no estado %q", e.Event, e.From)
 }
-
-//incompleto
