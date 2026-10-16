@@ -1,0 +1,39 @@
+# docker-compose.yml
+# Infraestrutura local do payrouter. Nesta sessão só o PostgreSQL 16 e o serviço de
+# migrations; Kafka, Mongo e Redis entram nas fases seguintes.
+# Objetivo: `make up` e `make migrate-up` bastam para ter o banco pronto, sem instalar nada.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: payrouter
+      POSTGRES_PASSWORD: payrouter
+      POSTGRES_DB: payrouter
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payrouter -d payrouter"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Roda sob demanda (profile tools): docker compose run --rm migrate up
+  migrate:
+    image: migrate/migrate:v4.18.1
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations
+    entrypoint:
+      - migrate
+      - -path=/migrations
+      - -database=postgres://payrouter:payrouter@postgres:5432/payrouter?sslmode=disable
+    command: ["up"]
+
+volumes:
+  pgdata:

@@ -1,0 +1,19 @@
+# .gitignore: arquivos que o git ignora neste repositório.
+# Objetivo: manter fora do histórico binários, artefatos de teste e segredos locais.
+
+# Binários e artefatos de build
+/bin/
+*.exe
+*.test
+*.out
+
+# Perfis e saídas de medição locais (os dados oficiais ficam em docs/bench/)
+*.prof
+coverage.*
+
+# Ambiente local
+.env
+.idea/
+.vscode/
+
+claude.md

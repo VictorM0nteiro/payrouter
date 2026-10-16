@@ -1,0 +1,34 @@
+# .golangci.yml
+# Configuração do golangci-lint v2.
+# Objetivo: além do lint padrão, tornar executável a regra inviolável do projeto:
+# internal/domain/ não pode importar infraestrutura. Se importar, o CI falha.
+
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - depguard
+    - errorlint
+    - bodyclose
+  settings:
+    depguard:
+      rules:
+        domain-puro:
+          files:
+            - "**/internal/domain/**"
+          deny:
+            - pkg: database/sql
+              desc: o domínio não conhece banco
+            - pkg: github.com/jackc/pgx
+              desc: o domínio não conhece Postgres
+            - pkg: net/http
+              desc: o domínio não conhece HTTP
+            - pkg: github.com/twmb/franz-go
+              desc: o domínio não conhece Kafka
+            - pkg: github.com/segmentio/kafka-go
+              desc: o domínio não conhece Kafka
+            - pkg: go.mongodb.org/mongo-driver
+              desc: o domínio não conhece Mongo
+            - pkg: github.com/redis/go-redis
+              desc: o domínio não conhece Redis
