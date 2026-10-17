@@ -4,22 +4,33 @@
 // N-1; se outro comando gravou antes, o append falha com ErrConcurrencyConflict. Sem lock
 // de linha e sem isolamento SERIALIZABLE: a garantia vem de duas coisas combinadas, o
 // UNIQUE (aggregate_id, version) e a checagem de versão dentro do próprio INSERT.
+// Funciona tanto sobre o pool quanto dentro de uma transação já aberta (UnitOfWork).
 
 package postgres
 
 import (
-        "context"
-        "errors"
-        "fmt"
+	"context"
+	"errors"
+	"fmt"
 
-        "github.com/jackc/pgx/v5/pgconn"
-        "github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
-        "github.com/VictorM0nteiro/payrouter/internal/app"
-        "github.com/VictorM0nteiro/payrouter/internal/domain"
+	"github.com/VictorM0nteiro/payrouter/internal/app"
+	"github.com/VictorM0nteiro/payrouter/internal/domain"
 )
 
 const aggregateType = "PaymentInstruction"
+
+// dbtx é o que os stores precisam do banco. Tanto *pgxpool.Pool quanto pgx.Tx o satisfazem,
+// então o mesmo código roda avulso (cada Append abre sua transação) ou dentro de uma
+// transação externa (o Begin vira um savepoint).
+type dbtx interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 // insertEvent só insere se a versão atual do agregado for exatamente $3 - 1.
 //
@@ -41,88 +52,90 @@ ORDER BY version`
 
 // EventStore implementa app.EventStore sobre o Postgres.
 type EventStore struct {
-        pool *pgxpool.Pool
+	db dbtx
 }
 
 var _ app.EventStore = (*EventStore)(nil)
 
-func NewEventStore(pool *pgxpool.Pool) *EventStore {
-        return &EventStore{pool: pool}
+func NewEventStore(db dbtx) *EventStore {
+	return &EventStore{db: db}
 }
 
-// Append grava os eventos numa transação. Qualquer falha desfaz todos.
+// Append grava os eventos de forma atômica. Qualquer falha desfaz todos. Dentro de uma
+// transação externa, a atomicidade vem de um savepoint: um conflito desfaz só este Append
+// e a transação externa continua utilizável.
 func (s *EventStore) Append(ctx context.Context, id domain.InstructionID, expectedVersion int, events ...domain.Event) error {
-        if expectedVersion < 0 {
-                return fmt.Errorf("versão esperada inválida: %d", expectedVersion)
-        }
-        if len(events) == 0 {
-                return nil
-        }
+	if expectedVersion < 0 {
+		return fmt.Errorf("versão esperada inválida: %d", expectedVersion)
+	}
+	if len(events) == 0 {
+		return nil
+	}
 
-        tx, err := s.pool.Begin(ctx)
-        if err != nil {
-                return fmt.Errorf("iniciando transação: %w", err)
-        }
-        // Após o Commit, o Rollback é no-op.
-        defer func() { _ = tx.Rollback(ctx) }()
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("iniciando transação: %w", err)
+	}
+	// Após o Commit, o Rollback é no-op.
+	defer func() { _ = tx.Rollback(ctx) }()
 
-        for i, e := range events {
-                payload, err := encode(e)
-                if err != nil {
-                        return err
-                }
-                version := expectedVersion + i + 1
+	for i, e := range events {
+		payload, err := encode(e)
+		if err != nil {
+			return err
+		}
+		version := expectedVersion + i + 1
 
-                tag, err := tx.Exec(ctx, insertEvent, string(id), aggregateType, version, string(e.Type()), payload)
-                if err != nil {
-                        if isUniqueViolation(err) {
-                                return app.ErrConcurrencyConflict
-                        }
-                        return fmt.Errorf("gravando evento %s v%d: %w", e.Type(), version, err)
-                }
-                if tag.RowsAffected() == 0 {
-                        return app.ErrConcurrencyConflict
-                }
-        }
+		tag, err := tx.Exec(ctx, insertEvent, string(id), aggregateType, version, string(e.Type()), payload)
+		if err != nil {
+			if isUniqueViolation(err) {
+				return app.ErrConcurrencyConflict
+			}
+			return fmt.Errorf("gravando evento %s v%d: %w", e.Type(), version, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return app.ErrConcurrencyConflict
+		}
+	}
 
-        if err := tx.Commit(ctx); err != nil {
-                return fmt.Errorf("confirmando transação: %w", err)
-        }
-        return nil
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("confirmando transação: %w", err)
+	}
+	return nil
 }
 
 // Load devolve o histórico do agregado em ordem de versão.
 func (s *EventStore) Load(ctx context.Context, id domain.InstructionID) ([]domain.Event, error) {
-        rows, err := s.pool.Query(ctx, selectEvents, string(id))
-        if err != nil {
-                return nil, fmt.Errorf("consultando eventos: %w", err)
-        }
-        defer rows.Close()
+	rows, err := s.db.Query(ctx, selectEvents, string(id))
+	if err != nil {
+		return nil, fmt.Errorf("consultando eventos: %w", err)
+	}
+	defer rows.Close()
 
-        var events []domain.Event
-        for rows.Next() {
-                var eventType string
-                var payload []byte
-                if err := rows.Scan(&eventType, &payload); err != nil {
-                        return nil, fmt.Errorf("lendo linha de evento: %w", err)
-                }
-                e, err := decode(eventType, payload)
-                if err != nil {
-                        return nil, err
-                }
-                events = append(events, e)
-        }
-        if err := rows.Err(); err != nil {
-                return nil, fmt.Errorf("iterando eventos: %w", err)
-        }
-        if len(events) == 0 {
-                return nil, app.ErrNotFound
-        }
-        return events, nil
+	var events []domain.Event
+	for rows.Next() {
+		var eventType string
+		var payload []byte
+		if err := rows.Scan(&eventType, &payload); err != nil {
+			return nil, fmt.Errorf("lendo linha de evento: %w", err)
+		}
+		e, err := decode(eventType, payload)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterando eventos: %w", err)
+	}
+	if len(events) == 0 {
+		return nil, app.ErrNotFound
+	}
+	return events, nil
 }
 
 // isUniqueViolation reconhece a violação do UNIQUE (aggregate_id, version).
 func isUniqueViolation(err error) bool {
-        var pgErr *pgconn.PgError
-        return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
