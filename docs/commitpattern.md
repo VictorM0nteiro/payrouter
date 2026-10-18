@@ -24,11 +24,6 @@ Formato: `tipo(escopo opcional): resumo curto no imperativo`
 - Sem aspas decorativas nem negrito/itálico dentro do corpo — texto corrido.
 - Fecha citando como foi verificado (`go test -race ./...`, lint limpo, teste manual contra o container real) quando relevante.
 
-## Rodapé
-
-Toda vez que o trabalho teve participação da IA:
-
-Co-Authored-By: Claude Sonnet 5 noreply@anthropic.com
 
 ## Exemplo completo (deste projeto)
 
