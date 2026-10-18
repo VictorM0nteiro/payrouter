@@ -70,10 +70,13 @@ type PaymentInstruction struct {
 	attempts   int
 }
 
-func (p *PaymentInstruction) ID() InstructionID { return p.id }
-func (p *PaymentInstruction) Status() Status    { return p.status }
-func (p *PaymentInstruction) Amount() Money     { return p.amount }
-func (p *PaymentInstruction) Attempts() int     { return p.attempts }
+func (p *PaymentInstruction) ID() InstructionID  { return p.id }
+func (p *PaymentInstruction) Status() Status     { return p.status }
+func (p *PaymentInstruction) Amount() Money      { return p.amount }
+func (p *PaymentInstruction) Attempts() int      { return p.attempts }
+func (p *PaymentInstruction) Debtor() string     { return p.debtor }
+func (p *PaymentInstruction) Creditor() string   { return p.creditor }
+func (p *PaymentInstruction) EndToEndID() string { return p.endToEndID }
 
 // Version é a versão do último evento aplicado. Para usá-la como versão esperada no
 // Append, leia-a ANTES de executar o comando: os comandos aplicam o evento no próprio

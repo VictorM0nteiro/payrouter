@@ -130,7 +130,7 @@ produz eventos; quem grava é o adapter. Se o domínio importar pgx, a fase A fa
 | Sessão | Entrega |
 |---|---|
 | 5 | Caso de uso "aceitar instrução" + idempotência escopada com fingerprint, na mesma transação |
-| 6 | HTTP: `POST /instructions` (202), `GET /instructions/{id}` autoritativo, DTOs, erro de domínio → status |
+| 6 | HTTP: `POST /instructions` (202), `GET /instructions/{id}` autoritativo, DTOs, erro de domínio → status; `POST /auth/token` (client_id + segredo → JWT HS256 de 15 min), clientes na tabela `clients`, cadastro por `cmd/clientctl` |
 | 7 | Correlation ID, `log/slog`, timeouts explícitos, `context` propagado, `/healthz` e `/readyz` separados |
 | 8 | `docker compose up`, graceful shutdown completo, README v1 |
 

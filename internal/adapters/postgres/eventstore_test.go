@@ -10,7 +10,10 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -77,20 +80,29 @@ func startPostgres(ctx context.Context) error {
 	return applyMigration(ctx, testPool)
 }
 
-// applyMigration roda o 000001_init.up.sql. Usa o protocolo simples da conexão crua, que
-// aceita várias instruções numa só chamada.
+// applyMigration roda todos os *.up.sql em ordem de nome. Usa o protocolo simples da
+// conexão crua, que aceita várias instruções numa só chamada.
 func applyMigration(ctx context.Context, pool *pgxpool.Pool) error {
-	sql, err := os.ReadFile("../../../migrations/000001_init.up.sql")
+	files, err := filepath.Glob("../../../migrations/*.up.sql")
 	if err != nil {
 		return err
 	}
+	sort.Strings(files)
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
-	_, err = conn.Conn().PgConn().Exec(ctx, string(sql)).ReadAll()
-	return err
+	for _, f := range files {
+		sql, err := os.ReadFile(f)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.Conn().PgConn().Exec(ctx, string(sql)).ReadAll(); err != nil {
+			return fmt.Errorf("aplicando %s: %w", filepath.Base(f), err)
+		}
+	}
+	return nil
 }
 
 // newStore devolve o store e falha o teste, com instrução, se o Docker não subiu.

@@ -96,7 +96,7 @@ chutar; e medir o custo da consistência eventual em vez de afirmá-lo.
 
 - Ledger, saldo, partidas dobradas — isso é o wallet-go, e repetir desperdiça o projeto
 - Integração com SPI, Bacen, Dict ou qualquer sistema real
-- Autenticação além de uma API key estática
+- Autenticação além de client_id + segredo trocados por um JWT curto (15 min, sem refresh, sem revogação, sem OAuth completo nem papéis)
 - Multi-moeda, agendamento, instrução recorrente
 - Frontend de qualquer tipo
 - Saga com compensação entre múltiplos agregados
