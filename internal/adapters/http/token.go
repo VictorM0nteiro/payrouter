@@ -14,13 +14,13 @@ import (
 func (h *handler) postToken(w http.ResponseWriter, r *http.Request) {
 	var req tokenRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		writeError(w, err)
+		writeError(w, r, err)
 		return
 	}
 
 	res, err := h.authn.Execute(r.Context(), req.ClientID, req.ClientSecret)
 	if err != nil {
-		writeError(w, err)
+		writeError(w, r, err)
 		return
 	}
 

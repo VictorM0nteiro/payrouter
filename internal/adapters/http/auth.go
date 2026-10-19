@@ -41,13 +41,18 @@ func authenticate(verifier app.TokenVerifier, next http.HandlerFunc) http.Handle
 	return func(w http.ResponseWriter, r *http.Request) {
 		token, ok := bearerToken(r)
 		if !ok {
-			writeError(w, errUnauthorized)
+			writeError(w, r, errUnauthorized)
 			return
 		}
 		clientID, err := verifier.Verify(token)
 		if err != nil {
-			writeError(w, errUnauthorized)
+			writeError(w, r, errUnauthorized)
 			return
+		}
+		// O log de acesso é a camada de fora e só enxerga o contexto original; este registro
+		// compartilhado é como ele fica sabendo quem foi autenticado.
+		if info := infoFrom(r.Context()); info != nil {
+			info.clientID = clientID
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), clientKey{}, clientID)))
 	}

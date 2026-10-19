@@ -22,13 +22,13 @@ const maxBodyBytes = 1 << 20
 func (h *handler) postInstruction(w http.ResponseWriter, r *http.Request) {
 	var req acceptRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		writeError(w, err)
+		writeError(w, r, err)
 		return
 	}
 
 	res, err := h.accept.Execute(r.Context(), acceptInput(r, req))
 	if err != nil {
-		writeError(w, err)
+		writeError(w, r, err)
 		return
 	}
 

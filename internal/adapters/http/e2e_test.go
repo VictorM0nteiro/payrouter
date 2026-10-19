@@ -88,7 +88,7 @@ func newEnv(t *testing.T) *env {
 	get := app.NewGetInstruction(postgres.NewEventStore(e2e.pool))
 	authn := app.NewAuthenticateClient(e.clients, signer)
 
-	e.srv = httptest.NewServer(NewHandler(accept, get, authn, signer))
+	e.srv = httptest.NewServer(NewRoot(NewHandler(accept, get, authn, signer), e2e.pool, 5*time.Second))
 	t.Cleanup(e.srv.Close)
 	return e
 }
@@ -345,5 +345,55 @@ func TestE2EValorInvalidoNaoConsomeAChave(t *testing.T) {
 	status, _, data = call(t, "POST", e.srv.URL+"/instructions", uniqueBody(), headers)
 	if status != http.StatusAccepted {
 		t.Errorf("depois de corrigir: status %d, corpo %s", status, data)
+	}
+}
+
+func TestE2ECorrelationIDDevolvidoELogado(t *testing.T) {
+	buf := captureLogs(t)
+	e := newEnv(t)
+	id, secret := e.newClient(t)
+	token := e.login(t, id, secret)
+
+	headers := withKey(token, uuid.NewString())
+	headers["X-Correlation-ID"] = "e2e-corr-1"
+	status, hdr, _ := call(t, "POST", e.srv.URL+"/instructions", uniqueBody(), headers)
+
+	if status != http.StatusAccepted || hdr.Get("X-Correlation-ID") != "e2e-corr-1" {
+		t.Fatalf("status %d, correlation %q", status, hdr.Get("X-Correlation-ID"))
+	}
+	found := false
+	for _, m := range logLines(t, buf) {
+		if m["msg"] == "request" && m["correlation_id"] == "e2e-corr-1" && m["client_id"] == id && m["route"] == "POST /instructions" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("linha de acesso com o correlation_id e o cliente não encontrada:\n%s", buf)
+	}
+}
+
+func TestE2EReadyzComBancoEComPoolFechado(t *testing.T) {
+	e := newEnv(t)
+
+	status, _, data := call(t, "GET", e.srv.URL+"/readyz", "", nil)
+	if status != http.StatusOK {
+		t.Fatalf("com o banco no ar: status %d, corpo %s", status, data)
+	}
+
+	closed, err := pgxpool.NewWithConfig(context.Background(), e2e.pool.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	srv := httptest.NewServer(NewRoot(http.NotFoundHandler(), closed, time.Second))
+	defer srv.Close()
+
+	status, _, _ = call(t, "GET", srv.URL+"/readyz", "", nil)
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("pool fechado: readyz = %d, esperado 503", status)
+	}
+	status, _, _ = call(t, "GET", srv.URL+"/healthz", "", nil)
+	if status != http.StatusOK {
+		t.Errorf("pool fechado: healthz = %d, esperado 200", status)
 	}
 }

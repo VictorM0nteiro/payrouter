@@ -7,9 +7,10 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/VictorM0nteiro/payrouter/internal/app"
@@ -44,11 +45,20 @@ var errorTable = []errorMapping{
 	{app.ErrIdempotencyKeyReuse, http.StatusUnprocessableEntity, "idempotency_key_reuse", "esta Idempotency-Key já foi usada com outro corpo"},
 	{app.ErrNotFound, http.StatusNotFound, "not_found", "instrução não encontrada"},
 	{app.ErrConcurrencyConflict, http.StatusConflict, "concurrency_conflict", "outra operação alterou a instrução ao mesmo tempo, tente novamente"},
+
+	// Prazo estourado: o servidor não sabe se a operação chegou a ser gravada. É o estado
+	// desconhecido na borda HTTP. Repetir com a mesma Idempotency-Key é seguro.
+	{context.DeadlineExceeded, http.StatusGatewayTimeout, "request_timeout", "tempo esgotado: o resultado é desconhecido; repita com a mesma Idempotency-Key"},
+	{context.Canceled, statusClientClosed, "request_canceled", "requisição cancelada pelo cliente"},
 }
+
+// statusClientClosed é o 499 (não padronizado, convenção do nginx): o cliente desistiu antes
+// da resposta.
+const statusClientClosed = 499
 
 // writeError escreve o erro no formato padrão. A mensagem vem da tabela, nunca do erro
 // original, para não vazar detalhe interno.
-func writeError(w http.ResponseWriter, err error) {
+func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	for _, m := range errorTable {
 		if errors.Is(err, m.target) {
 			if errors.Is(m.target, errUnauthorized) {
@@ -58,9 +68,9 @@ func writeError(w http.ResponseWriter, err error) {
 			return
 		}
 	}
-	// Erro desconhecido: registra o detalhe aqui e devolve só um 500 genérico.
-	// Substituído por slog com correlation ID na sessão 7.
-	log.Printf("erro interno: %v", err)
+	// Erro desconhecido: o detalhe vai para o log (com o correlation ID do contexto) e o
+	// cliente recebe só um 500 genérico.
+	slog.ErrorContext(r.Context(), "erro interno", "error", err)
 	writeJSON(w, http.StatusInternalServerError,
 		errorBody{Error: errorDetail{Code: "internal", Message: "erro interno"}})
 }
@@ -70,6 +80,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("escrevendo resposta: %v", err)
+		slog.Error("escrevendo resposta", "error", err)
 	}
 }

@@ -10,9 +10,11 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/VictorM0nteiro/payrouter/internal/app"
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
+	"github.com/VictorM0nteiro/payrouter/internal/logging"
 )
 
 // acceptor é o que o handler de POST /instructions precisa do caso de uso.
@@ -34,6 +36,43 @@ type handler struct {
 	accept acceptor
 	get    getter
 	authn  authenticator
+}
+
+// readyTimeout é o prazo do ping do /readyz: uma sonda lenta conta como indisponível.
+const readyTimeout = 2 * time.Second
+
+// NewRoot junta tudo no handler que o http.Server serve: as sondas (sem log de acesso, sem
+// autenticação) e a API embrulhada em correlation ID, prazo por requisição e log de acesso.
+func NewRoot(api http.Handler, ready Pinger, requestTimeout time.Duration) http.Handler {
+	ops := NewOps(ready, readyTimeout)
+
+	root := http.NewServeMux()
+	// Sem método no padrão: o mux de ops é quem responde 405 a um POST nas sondas.
+	root.Handle("/healthz", ops)
+	root.Handle("/readyz", ops)
+	root.Handle("/", wrap(api, requestTimeout))
+	return root
+}
+
+// wrap aplica, numa única passada, o que toda requisição da API precisa: correlation ID (no
+// contexto, no log e no header da resposta), o prazo e o log de acesso. É uma função só, e
+// não três middlewares empilhados, porque o log de acesso precisa ler r.Pattern depois do
+// atendimento e o ServeMux o grava na requisição que ele recebe: tem de ser a mesma.
+func wrap(next http.Handler, requestTimeout time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := correlationIDFor(r)
+		w.Header().Set(correlationHeader, id)
+
+		ctx, cancel := context.WithTimeout(logging.WithCorrelationID(r.Context(), id), requestTimeout)
+		defer cancel()
+		info := &requestInfo{}
+		r = r.WithContext(withRequestInfo(ctx, info))
+
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+		logAccess(r, rec.status, info, time.Since(start))
+	})
 }
 
 // NewHandler devolve o http.Handler da API.

@@ -22,13 +22,13 @@ const uuidTextLen = 36
 func (h *handler) getInstruction(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, err := uuid.Parse(id); err != nil || len(id) != uuidTextLen {
-		writeError(w, errInvalidID)
+		writeError(w, r, errInvalidID)
 		return
 	}
 
 	view, err := h.get.Execute(r.Context(), domain.InstructionID(id))
 	if err != nil {
-		writeError(w, err)
+		writeError(w, r, err)
 		return
 	}
 
