@@ -29,3 +29,10 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test -race ./...
+
+  # Garante que a imagem da API continua compilando (o compose depende dela).
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t payrouter .

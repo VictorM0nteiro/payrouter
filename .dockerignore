@@ -1,0 +1,10 @@
+# .dockerignore
+# Arquivos que não entram no contexto de build da imagem.
+# Objetivo: build rápido e sem vazar segredo local (.env) nem histórico para dentro da imagem.
+
+.git
+.github
+.env
+docs
+*.md
+*_test.go

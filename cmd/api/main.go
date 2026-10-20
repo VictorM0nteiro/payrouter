@@ -3,17 +3,22 @@
 // ADDR, LOG_FORMAT, REQUEST_TIMEOUT), liga as peças e sobe o servidor HTTP.
 // Objetivo: ser a única "composition root" da API. É aqui, e só aqui, que o Postgres, os
 // casos de uso e o adapter HTTP se encontram, e onde todos os prazos ficam explícitos:
-// nenhum valor padrão do net/http ou do pgx decide por nós. Graceful shutdown entra na
-// sessão 8; esta versão sobe e atende.
+// nenhum valor padrão do net/http ou do pgx decide por nós. Também desliga com elegância:
+// ao receber SIGINT/SIGTERM, para de aceitar conexões, deixa as requisições em andamento
+// terminarem e só então fecha o pool do Postgres.
 
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,6 +47,10 @@ const (
 	readTimeout       = 10 * time.Second
 	writeTimeout      = 15 * time.Second
 	idleTimeout       = 60 * time.Second
+
+	// shutdownTimeout é quanto o desligamento espera as requisições em andamento. Fica abaixo
+	// do stop_grace_period do compose (15s), senão o SIGKILL chegaria antes.
+	shutdownTimeout = 10 * time.Second
 
 	// Prazos do pool do Postgres.
 	connectTimeout    = 5 * time.Second
@@ -78,7 +87,7 @@ func run() error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	poolCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -87,12 +96,12 @@ func run() error {
 	poolCfg.ConnConfig.ConnectTimeout = connectTimeout
 	poolCfg.MaxConnLifetime = maxConnLifetime
 	poolCfg.HealthCheckPeriod = healthCheckPeriod
-	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	pool, err := pgxpool.NewWithConfig(startCtx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("criando pool do Postgres: %w", err)
 	}
 	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
+	if err := pool.Ping(startCtx); err != nil {
 		return fmt.Errorf("conectando ao Postgres: %w", err)
 	}
 
@@ -111,8 +120,52 @@ func run() error {
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,
 	}
+	// Abrir o listener aqui, e não dentro do servidor, faz um endereço ocupado falhar já na
+	// partida, antes de qualquer outra coisa.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("escutando em %s: %w", addr, err)
+	}
+
+	// SIGINT (Ctrl-C) e SIGTERM (docker stop) iniciam o desligamento. Depois do primeiro, o
+	// stop() devolve o tratamento padrão: um segundo sinal derruba o processo na hora.
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() { <-sigCtx.Done(); stop() }()
+
 	slog.Info("api ouvindo", "addr", addr, "request_timeout", requestTimeout.String())
-	return srv.ListenAndServe()
+	return serve(sigCtx, srv, ln, shutdownTimeout)
+}
+
+// serve atende em ln até o contexto terminar e então desliga com elegância: fecha o
+// listener (nenhuma conexão nova), deixa as requisições em andamento terminarem por até
+// shutdownTimeout e só depois devolve. O pool do Postgres é fechado por quem chamou, depois
+// daqui, para nenhuma requisição ainda em curso perder o banco.
+//
+// Uma requisição que não termina no prazo é cortada. Para o cliente isso é um resultado
+// desconhecido, o mesmo caso do 504: ele repete com a mesma Idempotency-Key.
+func serve(ctx context.Context, srv *http.Server, ln net.Listener, shutdownTimeout time.Duration) error {
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+
+	select {
+	case err := <-errc:
+		return err // o servidor caiu sozinho, antes de qualquer sinal
+	case <-ctx.Done():
+	}
+
+	slog.Info("encerrando: aguardando requisições em andamento", "timeout", shutdownTimeout.String())
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		_ = srv.Close() // prazo estourado: corta o que sobrou
+		return fmt.Errorf("desligando o servidor: %w", err)
+	}
+	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	slog.Info("api encerrada")
+	return nil
 }
 
 // durationFromEnv lê uma duração (ex.: "5s") da variável, ou devolve def se ela estiver vazia.

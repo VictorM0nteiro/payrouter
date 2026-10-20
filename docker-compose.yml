@@ -1,7 +1,9 @@
 # docker-compose.yml
-# Infraestrutura local do payrouter. Nesta sessão só o PostgreSQL 16 e o serviço de
-# migrations; Kafka, Mongo e Redis entram nas fases seguintes.
-# Objetivo: `make up` e `make migrate-up` bastam para ter o banco pronto, sem instalar nada.
+# Infraestrutura local do payrouter: PostgreSQL 16, as migrations e a API. Kafka, Mongo e
+# Redis entram nas fases seguintes.
+# Objetivo: `make env && make up` bastam para ter o sistema inteiro no ar, sem instalar nada.
+# A ordem é garantida pelo compose: o Postgres fica saudável, as migrations rodam até o fim e
+# só então a API sobe.
 
 services:
   postgres:
@@ -20,10 +22,9 @@ services:
       timeout: 3s
       retries: 15
 
-  # Roda sob demanda (profile tools): docker compose run --rm migrate up
+  # Roda uma vez e termina. Também serve a `docker compose run --rm migrate down -all`.
   migrate:
     image: migrate/migrate:v4.18.1
-    profiles: ["tools"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -34,6 +35,28 @@ services:
       - -path=/migrations
       - -database=postgres://payrouter:payrouter@postgres:5432/payrouter?sslmode=disable
     command: ["up"]
+
+  api:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://payrouter:payrouter@postgres:5432/payrouter?sslmode=disable
+      # Vem do .env (veja `make env`). Sem ele o compose recusa subir, em vez de usar um
+      # segredo conhecido.
+      JWT_SECRET: "${JWT_SECRET:?JWT_SECRET ausente, rode make env}"
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    ports:
+      - "8080:8080"
+    # O shutdown da API espera as requisições em andamento por até 10 s; o compose precisa
+    # esperar mais que isso antes de enviar SIGKILL.
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
 
 volumes:
   pgdata:

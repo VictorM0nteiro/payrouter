@@ -1,7 +1,8 @@
 <!--
-README.md: porta de entrada do repositório payrouter.
-Objetivo: dizer em poucas linhas o que o sistema é, qual a tese, em que estado está e como
-rodar. É a versão mínima; o README final (arquitetura, medições, limitações) vem na Fase G.
+README.md: porta de entrada do repositório payrouter (v1, fim da Fase B).
+Objetivo: quem clona consegue subir o sistema, cadastrar um cliente e criar uma instrução sem
+perguntar nada a ninguém. Também diz o que o sistema é, qual a tese, em que estado está e o
+que ainda não existe. O README final (arquitetura, medições, limitações) vem na Fase G.
 -->
 
 # payrouter
@@ -18,71 +19,90 @@ a outro sistema, então o projeto documenta decisões defensáveis sob incerteza
 sourcing, outbox transacional, consumidores idempotentes por versão e conciliação por
 consulta de status, nunca por reenvio.
 
+Isso já aparece na borda HTTP. Se o prazo de uma requisição estoura no meio do commit, o
+servidor não sabe se a instrução foi gravada: responde `504` e o cliente repete com a mesma
+`Idempotency-Key`, o que é seguro porque a chave é gravada na mesma transação do evento.
+
 ## Estado atual
 
-Fase A concluída (sessões 1 a 4): domínio com a máquina de estados, event store em Postgres
-com concorrência otimista e teste com 32 goroutines disputando o mesmo agregado.
+Fases A e B concluídas (sessões 1 a 8): domínio com a máquina de estados, event store em
+Postgres com concorrência otimista, aceitar instrução com idempotência escopada, API HTTP
+com autenticação por token temporário, correlation ID, logs estruturados, prazos explícitos,
+sondas de saúde e desligamento elegante.
 
-Fase B em andamento (sessões 5 a 7 prontas): aceitar instrução com idempotência escopada
-na mesma transação, a API HTTP com autenticação por token temporário, e a observabilidade
-básica (correlation ID, logs estruturados, prazos explícitos, sondas de saúde).
-
-Ainda não existe Kafka, projeção nem participante simulado. O plano completo está em
+Ainda não existem Kafka, projeção nem participante simulado: a instrução é aceita e fica em
+`accepted`. O roteamento assíncrono é a Fase C. O plano completo está em
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
-## Como rodar
+## Subir e testar em cinco minutos
 
-Requisitos: Go, Docker e `make` (no Windows, via Git Bash ou WSL).
+Requisitos: Docker (com Compose) e `make`. No Windows, use Git Bash ou WSL.
 
 ```bash
-make up           # sobe o Postgres 16
-make migrate-up   # aplica as migrations
+make up            # cria o .env com um JWT_SECRET aleatório e sobe Postgres, migrations e API
+make demo-client   # cadastra o cliente "demo" e imprime o client_secret (uma única vez)
+```
+
+Com o `client_secret` em mãos:
+
+```bash
+# 1. autenticar: devolve um token que vale 15 minutos
+curl -s localhost:8080/auth/token \
+  -d '{"client_id":"demo","client_secret":"<segredo>"}'
+
+# 2. criar uma instrução (Idempotency-Key obrigatório, valor sempre em centavos)
+curl -si localhost:8080/instructions \
+  -H "Authorization: Bearer <access_token>" -H "Idempotency-Key: minha-chave-1" \
+  -d '{"debtor":"a","creditor":"b","amount_cents":15000,"end_to_end_id":"e2e-1"}'
+
+# 3. repetir o passo 2 devolve a mesma instrução, com o header Idempotent-Replayed: true
+
+# 4. consultar (estado reconstruído do event store, sem atraso)
+curl -s localhost:8080/instructions/<id> -H "Authorization: Bearer <access_token>"
+```
+
+Para outro cliente: `make demo-client ID=loja-a`. Para acompanhar os logs: `make logs`.
+Para parar: `make down` (acrescente `-v` ao `docker compose down` para apagar o banco).
+
+## Desenvolvimento
+
+```bash
+make db           # só o Postgres, para rodar a API com `go run ./cmd/api`
+make migrate-up   # aplica as migrations (o `make up` já faz isso)
 make test         # go test -race ./... (os testes de integração usam o Docker)
+make test-flake   # os testes de concorrência 20 vezes sob -race
 make lint
 ```
 
+Para rodar a API fora do Docker, exporte `DATABASE_URL`
+(`postgres://payrouter:payrouter@localhost:5432/payrouter?sslmode=disable`) e `JWT_SECRET`
+(o valor do `.env`) e use `go run ./cmd/api`. Clientes: `go run ./cmd/clientctl create <id>`.
+
 ## API
-
-A API lê `DATABASE_URL` e `JWT_SECRET` (mínimo de 32 bytes; assina os tokens). Os clientes
-ficam no banco e são cadastrados por linha de comando; o segredo aparece uma única vez.
-
-```bash
-export DATABASE_URL='postgres://...'
-export JWT_SECRET='um-segredo-aleatorio-com-pelo-menos-32-bytes'
-
-go run ./cmd/clientctl create loja-a     # imprime client_id e client_secret
-go run ./cmd/api                         # ouve em :8080 (ADDR altera)
-
-# 1. autenticar: devolve um token que vale 15 minutos
-curl -s localhost:8080/auth/token \
-  -d '{"client_id":"loja-a","client_secret":"<segredo>"}'
-
-# 2. criar uma instrução (Idempotency-Key obrigatório, valor sempre em centavos)
-curl -s localhost:8080/instructions \
-  -H "Authorization: Bearer <access_token>" -H "Idempotency-Key: $(uuidgen)" \
-  -d '{"debtor":"a","creditor":"b","amount_cents":15000,"end_to_end_id":"e2e-1"}'
-
-# 3. consultar (estado reconstruído do event store, sem atraso)
-curl -s localhost:8080/instructions/<id> -H "Authorization: Bearer <access_token>"
-```
 
 | Rota | Resposta |
 |---|---|
 | `POST /auth/token` | `200` com `access_token`; `401 invalid_credentials` igual para cliente inexistente, segredo errado e cliente inativo |
-| `POST /instructions` | `202` com `Location`; repetição da mesma chave devolve a mesma resposta com `Idempotent-Replayed: true` |
+| `POST /instructions` | `202` com `Location`; repetição da mesma chave devolve a mesma resposta com `Idempotent-Replayed: true`; a mesma chave com outro corpo é `422` |
 | `GET /instructions/{id}` | `200`, `404` se não existir, `400` se o id não for UUID |
+| `GET /healthz`, `GET /readyz` | sondas públicas, veja abaixo |
 
-Token ausente, inválido ou expirado dá `401` com `WWW-Authenticate: Bearer`: o cliente
-autentica de novo. Um token já emitido vale até expirar mesmo se o cliente for desativado
+Erros têm sempre o formato `{"error":{"code":"...","message":"..."}}`. Token ausente,
+inválido ou expirado dá `401` com `WWW-Authenticate: Bearer`: o cliente autentica de novo.
+Um token já emitido vale até expirar mesmo se o cliente for desativado
 (`clientctl deactivate`), no máximo 15 minutos.
 
-### Observabilidade e prazos
+### Configuração
 
 | Variável | Padrão | Efeito |
 |---|---|---|
+| `DATABASE_URL` | (obrigatória) | conexão com o Postgres |
+| `JWT_SECRET` | (obrigatória) | assina os tokens; no mínimo 32 bytes |
 | `ADDR` | `:8080` | endereço de escuta |
 | `LOG_FORMAT` | `json` | `text` escreve logs legíveis no terminal |
 | `REQUEST_TIMEOUT` | `5s` | prazo de cada requisição, repassado ao Postgres pelo contexto |
+
+### Observabilidade e prazos
 
 - **Correlation ID**: o header `X-Correlation-ID` do cliente é reaproveitado se tiver até 64
   caracteres de `[A-Za-z0-9._-]`; senão o servidor gera um UUID. Ele volta em toda resposta
@@ -90,8 +110,7 @@ autentica de novo. Um token já emitido vale até expirar mesmo se o cliente for
 - **Log de acesso**: uma linha por requisição com `method`, `route` (o padrão, como
   `GET /instructions/{id}`), `status`, `duration_ms` e `client_id`. Nunca grava token, corpo
   nem valores.
-- **Prazo estourado**: `504 request_timeout`. O servidor não sabe se a instrução chegou a ser
-  gravada; o cliente repete com a mesma `Idempotency-Key`, que é seguro. Cliente que
+- **Prazo estourado**: `504 request_timeout`, com o resultado desconhecido. Cliente que
   desiste da conexão vira `499` nos logs.
 - **Sondas** (públicas, sem log de acesso): `GET /healthz` diz se o processo está vivo e
   nunca consulta o banco; `GET /readyz` pinga o Postgres (limite de 2 s) e responde `503`,
@@ -99,6 +118,21 @@ autentica de novo. Um token já emitido vale até expirar mesmo se o cliente for
 - **Prazos do servidor**: `ReadHeaderTimeout` 5 s, `ReadTimeout` 10 s, `WriteTimeout` 15 s
   (maior que o prazo da requisição, para o 504 caber), `IdleTimeout` 60 s; pool com
   `ConnectTimeout` 5 s e conexões renovadas a cada 30 min.
+
+### Desligamento
+
+Ao receber `SIGINT` ou `SIGTERM` (`docker stop`), a API para de aceitar conexões, espera as
+requisições em andamento por até 10 s e só então fecha o pool do Postgres. Uma requisição que
+não termina nesse prazo é cortada, e para o cliente isso é o mesmo resultado desconhecido do
+`504`: repete com a mesma `Idempotency-Key`. Um segundo sinal derruba o processo na hora.
+
+## Limitações conhecidas (v1)
+
+- A instrução fica em `accepted`: não há roteamento, Kafka nem participante ainda (Fase C).
+- Token sem refresh e sem revogação antes de expirar; sem rate limit no `/auth/token`.
+- Sem TLS: pensado para rodar atrás de um proxy ou só em rede local.
+- Segredos de desenvolvimento do Postgres estão no `docker-compose.yml`; não use fora do
+  ambiente local.
 
 ## Documentação
 

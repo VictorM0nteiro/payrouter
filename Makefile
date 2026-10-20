@@ -3,7 +3,7 @@
 # Objetivo: ter um vocabulário único (test, lint, up, migrate-up...) igual ao do CLAUDE.md
 # e ao do CI. Rodar via Git Bash ou WSL (make não vem no Windows puro).
 
-.PHONY: test test-flake lint up down migrate-up migrate-down replay
+.PHONY: test test-flake lint env up db down logs demo-client migrate-up migrate-down replay
 
 test:
 	go test -race ./...
@@ -15,11 +15,28 @@ test-flake:
 lint:
 	golangci-lint run ./...
 
-up:
+# Cria o .env com um JWT_SECRET aleatório, se ainda não existir. Nunca sobrescreve.
+env:
+	@test -f .env || { printf 'JWT_SECRET=%s\n' "$$(openssl rand -hex 32)" > .env && echo ".env criado"; }
+
+# Sobe tudo (Postgres, migrations, API) e espera a API ficar pronta (/readyz).
+up: env
+	docker compose up -d --build --wait
+
+# Só o Postgres, para rodar a API ou os binários direto com `go run`.
+db:
 	docker compose up -d postgres
 
 down:
 	docker compose down
+
+logs:
+	docker compose logs -f api
+
+# Cadastra um cliente e imprime o segredo uma única vez: make demo-client ID=loja-a
+ID ?= demo
+demo-client: up
+	docker compose run --rm --no-deps --entrypoint clientctl api create $(ID)
 
 migrate-up:
 	docker compose run --rm migrate up
