@@ -22,6 +22,10 @@ import (
 
 const aggregateType = "PaymentInstruction"
 
+// instructionsTopic é o tópico Kafka de todos os eventos de instrução. Um tópico só, com a
+// chave igual ao aggregate_id: eventos do mesmo agregado caem na mesma partição, em ordem.
+const instructionsTopic = "payrouter.instructions.events"
+
 // dbtx é o que os stores precisam do banco. Tanto *pgxpool.Pool quanto pgx.Tx o satisfazem,
 // então o mesmo código roda avulso (cada Append abre sua transação) ou dentro de uma
 // transação externa (o Begin vira um savepoint).
@@ -40,9 +44,17 @@ type dbtx interface {
 // dois comandos que leem a mesma versão é decidida pelo UNIQUE: ambos passam no WHERE, e
 // o segundo a gravar leva violação 23505.
 const insertEvent = `
-INSERT INTO events (aggregate_id, aggregate_type, version, event_type, payload)
-SELECT $1::uuid, $2::text, $3::int, $4::text, $5::jsonb
-WHERE COALESCE((SELECT MAX(version) FROM events WHERE aggregate_id = $1::uuid), 0) = $3::int - 1`
+WITH ev AS (
+    INSERT INTO events (aggregate_id, aggregate_type, version, event_type, payload)
+    SELECT $1::uuid, $2::text, $3::int, $4::text, $5::jsonb
+    WHERE COALESCE((SELECT MAX(version) FROM events WHERE aggregate_id = $1::uuid), 0) = $3::int - 1
+    RETURNING id, aggregate_id, version, event_type, payload, occurred_at
+)
+INSERT INTO outbox (event_id, aggregate_id, topic, payload)
+SELECT id, aggregate_id, $6::text,
+       jsonb_build_object('aggregate_id', aggregate_id, 'version', version,
+                          'event_type', event_type, 'occurred_at', occurred_at, 'data', payload)
+FROM ev`
 
 const selectEvents = `
 SELECT event_type, payload
@@ -86,7 +98,7 @@ func (s *EventStore) Append(ctx context.Context, id domain.InstructionID, expect
 		}
 		version := expectedVersion + i + 1
 
-		tag, err := tx.Exec(ctx, insertEvent, string(id), aggregateType, version, string(e.Type()), payload)
+		tag, err := tx.Exec(ctx, insertEvent, string(id), aggregateType, version, string(e.Type()), payload, instructionsTopic)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return app.ErrConcurrencyConflict
