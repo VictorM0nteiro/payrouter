@@ -43,6 +43,11 @@ type dbtx interface {
 // a invariante de versões contíguas. A cláusula WHERE fecha esse caso. Já a corrida entre
 // dois comandos que leem a mesma versão é decidida pelo UNIQUE: ambos passam no WHERE, e
 // o segundo a gravar leva violação 23505.
+//
+// A linha de outbox sai do mesmo comando: o CTE devolve o evento recém-inserido e o segundo
+// INSERT a deriva dele. Não há caminho que grave evento sem outbox (invariante 2), e se o
+// guard barra o evento, o CTE fica vazio e nada vai para o outbox. O envelope carrega
+// versão e tipo para o consumidor ser idempotente pela versão do agregado.
 const insertEvent = `
 WITH ev AS (
     INSERT INTO events (aggregate_id, aggregate_type, version, event_type, payload)

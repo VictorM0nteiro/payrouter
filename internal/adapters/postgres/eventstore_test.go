@@ -228,7 +228,7 @@ func TestLoadDeAgregadoInexistenteEhNotFound(t *testing.T) {
 	}
 }
 
-func TestInvarianteDeVersoesContiguas(t *testing.T) {
+func TestInvariantesDoEventStore(t *testing.T) {
 	store := newStore(t)
 	ctx := ctxWithTimeout(t)
 	id := newID(t)
@@ -247,24 +247,49 @@ func TestInvarianteDeVersoesContiguas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Só a invariante 1 vale por enquanto. A 2 (todo evento tem uma linha de outbox)
-	// passa a valer na sessão 9, quando o outbox é gravado na mesma transação.
-	invariante1 := strings.Split(string(sql), ";")[0]
+	// O arquivo tem uma consulta por invariante, separadas por ";". Cada uma deve devolver
+	// zero linhas: 1 = versões contíguas, 2 = todo evento com exatamente uma linha de outbox.
+	for i, query := range strings.Split(string(sql), ";") {
+		if strings.TrimSpace(stripSQLComments(query)) == "" {
+			continue
+		}
+		if violadores := collectViolators(t, query); len(violadores) != 0 {
+			t.Errorf("invariante %d violada: %v", i+1, violadores)
+		}
+	}
+}
 
-	rows, err := testPool.Query(ctx, invariante1)
+// stripSQLComments remove as linhas de comentário "--", para detectar o trecho vazio depois
+// do último ";" do arquivo.
+func stripSQLComments(s string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// collectViolators executa uma consulta de invariante e devolve o que ela achou.
+func collectViolators(t *testing.T, query string) []string {
+	t.Helper()
+	rows, err := testPool.Query(ctxWithTimeout(t), query)
 	if err != nil {
-		t.Fatalf("executando invariante 1: %v", err)
+		t.Fatalf("executando invariante: %v", err)
 	}
 	defer rows.Close()
 	var violadores []string
 	for rows.Next() {
-		var agg string
-		if err := rows.Scan(&agg); err != nil {
+		var v any
+		if err := rows.Scan(&v); err != nil {
 			t.Fatal(err)
 		}
-		violadores = append(violadores, agg)
+		violadores = append(violadores, fmt.Sprint(v))
 	}
-	if len(violadores) != 0 {
-		t.Fatalf("agregados com versões não contíguas: %v", violadores)
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
+	return violadores
 }
