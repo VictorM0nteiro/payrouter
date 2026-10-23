@@ -8,8 +8,10 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/VictorM0nteiro/payrouter/internal/app"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -46,6 +48,53 @@ func NewOutboxStore(pool *pgxpool.Pool) *OutboxStore {
 
 // Drain: veja app.OutboxStore. A transação segura os locks durante o publish; se o processo
 // morrer ali, o Postgres desfaz e as linhas voltam a ficar elegíveis (at-least-once).
+// Drain: veja app.OutboxStore. A transação segura os locks durante o publish; se o processo
+// morrer ali, o Postgres desfaz e as linhas voltam a ficar elegíveis (at-least-once).
 func (s *OutboxStore) Drain(ctx context.Context, limit int, publish func(ctx context.Context, msgs []app.OutboxMessage) error) (int, error) {
-	
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("iniciando transação do outbox: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	rows, err := tx.Query(ctx, selectPending, limit)
+	if err != nil {
+		return 0, fmt.Errorf("consultando outbox: %w", err)
+	}
+	var msgs []app.OutboxMessage
+	for rows.Next() {
+		var m app.OutboxMessage
+		var payload string
+		if err := rows.Scan(&m.ID, &m.AggregateID, &m.Topic, &m.EventType, &m.Version, &payload); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("lendo linha do outbox: %w", err)
+		}
+		m.Payload = []byte(payload)
+		msgs = append(msgs, m)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterando outbox: %w", err)
+	}
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+
+	if err := publish(ctx, msgs); err != nil {
+		return 0, fmt.Errorf("publicando lote do outbox: %w", err)
+	}
+
+	markCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), markTimeout)
+	defer cancel()
+	ids := make([]int64, len(msgs))
+	for i, m := range msgs {
+		ids[i] = m.ID
+	}
+	if _, err := tx.Exec(markCtx, markPublished, ids); err != nil {
+		return 0, fmt.Errorf("marcando publicadas: %w", err)
+	}
+	if err := tx.Commit(markCtx); err != nil {
+		return 0, fmt.Errorf("confirmando outbox: %w", err)
+	}
+	return len(msgs), nil
 }
