@@ -30,8 +30,13 @@ Postgres com concorrência otimista, aceitar instrução com idempotência escop
 com autenticação por token temporário, correlation ID, logs estruturados, prazos explícitos,
 sondas de saúde e desligamento elegante.
 
-Ainda não existem Kafka, projeção nem participante simulado: a instrução é aceita e fica em
-`accepted`. O roteamento assíncrono é a Fase C. O plano completo está em
+Fase C em andamento (sessões 9 e 10): todo evento é gravado junto com uma linha de outbox, na
+mesma transação, e o relay publica o outbox no Kafka (Redpanda) com a chave igual ao
+`aggregate_id`. A entrega é at-least-once: se o relay cair entre publicar e marcar, a
+mensagem sai de novo, e quem consome é idempotente pela versão.
+
+Ainda não existem consumidor, projeção nem participante simulado: a instrução é aceita, vai
+para o tópico e fica em `accepted`. O plano completo está em
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Subir e testar em cinco minutos
@@ -39,7 +44,7 @@ Ainda não existem Kafka, projeção nem participante simulado: a instrução é
 Requisitos: Docker (com Compose) e `make`. No Windows, use Git Bash ou WSL.
 
 ```bash
-make up            # cria o .env com um JWT_SECRET aleatório e sobe Postgres, migrations e API
+make up            # cria o .env com um JWT_SECRET aleatório e sobe Postgres, migrations, Redpanda, API e relay
 make demo-client   # cadastra o cliente "demo" e imprime o client_secret (uma única vez)
 ```
 
@@ -61,7 +66,14 @@ curl -si localhost:8080/instructions \
 curl -s localhost:8080/instructions/<id> -H "Authorization: Bearer <access_token>"
 ```
 
-Para outro cliente: `make demo-client ID=loja-a`. Para acompanhar os logs: `make logs`.
+Para ver a instrução chegar ao Kafka:
+
+```bash
+docker compose exec redpanda rpk topic consume payrouter.instructions.events -n 5
+```
+
+Para outro cliente: `make demo-client ID=loja-a`. Para acompanhar os logs: `make logs` (API)
+e `make logs-relay` (relay).
 Para parar: `make down` (acrescente `-v` ao `docker compose down` para apagar o banco).
 
 ## Desenvolvimento
@@ -128,7 +140,11 @@ não termina nesse prazo é cortada, e para o cliente isso é o mesmo resultado 
 
 ## Limitações conhecidas (v1)
 
-- A instrução fica em `accepted`: não há roteamento, Kafka nem participante ainda (Fase C).
+- A instrução fica em `accepted`: o relay a publica no Kafka, mas ainda não há processor nem
+  participante (sessões 11 e 12).
+- Entrega at-least-once: o mesmo evento pode aparecer duas vezes no tópico depois da queda do
+  relay. Ainda não há consumidor; quando houver, ele descarta o que já viu pela versão.
+- O outbox publicado não é apagado: não há rotina de limpeza ainda.
 - Token sem refresh e sem revogação antes de expirar; sem rate limit no `/auth/token`.
 - Sem TLS: pensado para rodar atrás de um proxy ou só em rede local.
 - Segredos de desenvolvimento do Postgres estão no `docker-compose.yml`; não use fora do

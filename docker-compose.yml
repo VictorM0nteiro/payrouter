@@ -1,9 +1,9 @@
 # docker-compose.yml
-# Infraestrutura local do payrouter: PostgreSQL 16, as migrations e a API. Kafka, Mongo e
-# Redis entram nas fases seguintes.
+# Infraestrutura local do payrouter: PostgreSQL 16, as migrations, Redpanda (Kafka), a API e o
+# relay do outbox. Mongo e Redis entram nas fases seguintes.
 # Objetivo: `make env && make up` bastam para ter o sistema inteiro no ar, sem instalar nada.
 # A ordem é garantida pelo compose: o Postgres fica saudável, as migrations rodam até o fim e
-# só então a API sobe.
+# só então a API sobe; o relay espera também o tópico existir.
 
 services:
   postgres:
@@ -57,6 +57,53 @@ services:
       interval: 3s
       timeout: 3s
       retries: 10
+
+   # Broker compatível com Kafka (Redpanda), um nó só. Os serviços do compose falam por
+  # redpanda:9092; da máquina local, o endereço é localhost:19092.
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.18
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # Roda uma vez e termina: cria o tópico com 3 partições (a chave é o aggregate_id).
+  kafka-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.18
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - rpk -X brokers=redpanda:9092 topic create payrouter.instructions.events -p 3 || rpk -X brokers=redpanda:9092 topic describe payrouter.instructions.events
+
+    # Publica o outbox no Kafka. Pode rodar mais de uma instância: SKIP LOCKED reparte as
+  # linhas sem reordenar um agregado.
+  relay:
+    build: .
+    entrypoint: ["relay"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://payrouter:payrouter@postgres:5432/payrouter?sslmode=disable
+      KAFKA_BROKERS: redpanda:9092
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    # O relay termina a rodada em andamento ao receber SIGTERM; a rodada é curta.
+    stop_grace_period: 15s
 
 volumes:
   pgdata:

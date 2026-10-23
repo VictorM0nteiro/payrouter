@@ -19,7 +19,7 @@ lint:
 env:
 	@test -f .env || { printf 'JWT_SECRET=%s\n' "$$(openssl rand -hex 32)" > .env && echo ".env criado"; }
 
-# Sobe tudo (Postgres, migrations, API) e espera a API ficar pronta (/readyz).
+ # Sobe tudo (Postgres, migrations, Redpanda, API, relay) e espera a API ficar pronta (/readyz).
 up: env
 	docker compose up -d --build --wait
 
@@ -32,6 +32,9 @@ down:
 
 logs:
 	docker compose logs -f api
+
+logs-relay:
+        docker compose logs -f relay
 
 # Cadastra um cliente e imprime o segredo uma única vez: make demo-client ID=loja-a
 ID ?= demo
