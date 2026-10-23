@@ -38,7 +38,7 @@ const (
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "relay", err)
+		fmt.Fprintln(os.Stderr, "relay:", err)
 		os.Exit(1)
 	}
 }

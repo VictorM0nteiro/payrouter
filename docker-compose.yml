@@ -58,7 +58,7 @@ services:
       timeout: 3s
       retries: 10
 
-   # Broker compatível com Kafka (Redpanda), um nó só. Os serviços do compose falam por
+  # Broker compatível com Kafka (Redpanda), um nó só. Os serviços do compose falam por
   # redpanda:9092; da máquina local, o endereço é localhost:19092.
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v24.3.18
@@ -88,7 +88,7 @@ services:
     command:
       - rpk -X brokers=redpanda:9092 topic create payrouter.instructions.events -p 3 || rpk -X brokers=redpanda:9092 topic describe payrouter.instructions.events
 
-    # Publica o outbox no Kafka. Pode rodar mais de uma instância: SKIP LOCKED reparte as
+  # Publica o outbox no Kafka. Pode rodar mais de uma instância: SKIP LOCKED reparte as
   # linhas sem reordenar um agregado.
   relay:
     build: .

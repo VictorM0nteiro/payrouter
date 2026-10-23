@@ -75,7 +75,7 @@ func (r *Relay) Run(ctx context.Context) error {
 	return nil
 }
 
-//sleep espera d ou até o conteúdo terminar
+// sleep espera d ou até o conteúdo terminar
 func sleep(ctx context.Context, d time.Duration) {
 	t := time.NewTimer(d)
 	defer t.Stop()

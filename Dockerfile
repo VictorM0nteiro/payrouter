@@ -3,6 +3,7 @@
 # Objetivo: `docker compose up` conseguir subir a API e o relay sem Go instalado na máquina. O
 # primeiro estágio compila os binários estáticos; o segundo é um Alpine mínimo, rodando como
 # usuário sem privilégios, só com eles. O ENTRYPOINT padrão é a API; o compose troca por
+# `relay` no serviço do relay. O clientctl serve ao `make demo-client`.
 
 FROM golang:1.25-alpine AS build
 WORKDIR /src
