@@ -1,157 +1,160 @@
 <!--
-README.md: porta de entrada do repositório payrouter (v1, fim da Fase B).
-Objetivo: quem clona consegue subir o sistema, cadastrar um cliente e criar uma instrução sem
-perguntar nada a ninguém. Também diz o que o sistema é, qual a tese, em que estado está e o
-que ainda não existe. O README final (arquitetura, medições, limitações) vem na Fase G.
+README.md: entry point of the payrouter repository (v1, end of Phase B).
+Purpose: someone who clones it can bring up the system, register a client and create an
+instruction without asking anyone anything. It also says what the system is, what its thesis
+is, what state it is in and what does not exist yet. The final README (architecture,
+measurements, limitations) comes in Phase G.
 -->
 
 # payrouter
 
-Serviço que recebe instruções de pagamento, roteia cada uma para um participante externo
-e trata o **estado desconhecido como estado de primeira classe**: quando o envio dá timeout,
-o sistema não sabe se a operação aconteceu, registra essa incerteza e a resolve por
-conciliação ativa.
+A service that receives payment instructions, routes each one to an external participant
+and treats the **unknown state as a first-class state**: when a send times out, the system
+does not know whether the operation happened, records that uncertainty and resolves it
+through active reconciliation.
 
-## Tese
+## Thesis
 
-Correção quando a transação não existe mais. Não há `ROLLBACK` para uma mensagem já enviada
-a outro sistema, então o projeto documenta decisões defensáveis sob incerteza: event
-sourcing, outbox transacional, consumidores idempotentes por versão e conciliação por
-consulta de status, nunca por reenvio.
+Correctness when the transaction no longer exists. There is no `ROLLBACK` for a message
+already sent to another system, so the project documents defensible decisions under
+uncertainty: event sourcing, a transactional outbox, consumers idempotent by version and
+reconciliation by status query, never by resending.
 
-Isso já aparece na borda HTTP. Se o prazo de uma requisição estoura no meio do commit, o
-servidor não sabe se a instrução foi gravada: responde `504` e o cliente repete com a mesma
-`Idempotency-Key`, o que é seguro porque a chave é gravada na mesma transação do evento.
+This already shows at the HTTP edge. If a request's deadline expires in the middle of the
+commit, the server does not know whether the instruction was stored: it answers `504` and the
+client retries with the same `Idempotency-Key`, which is safe because the key is stored in
+the same transaction as the event.
 
-## Estado atual
+## Current state
 
-Fases A e B concluídas (sessões 1 a 8): domínio com a máquina de estados, event store em
-Postgres com concorrência otimista, aceitar instrução com idempotência escopada, API HTTP
-com autenticação por token temporário, correlation ID, logs estruturados, prazos explícitos,
-sondas de saúde e desligamento elegante.
+Phases A and B are complete (sessions 1 to 8): domain with the state machine, event store in
+Postgres with optimistic concurrency, accepting an instruction with scoped idempotency, HTTP
+API with temporary-token authentication, correlation ID, structured logs, explicit deadlines,
+health probes and graceful shutdown.
 
-Fase C em andamento (sessões 9 e 10): todo evento é gravado junto com uma linha de outbox, na
-mesma transação, e o relay publica o outbox no Kafka (Redpanda) com a chave igual ao
-`aggregate_id`. A entrega é at-least-once: se o relay cair entre publicar e marcar, a
-mensagem sai de novo, e quem consome é idempotente pela versão.
+Phase C is in progress (sessions 9 and 10): every event is stored together with an outbox
+row, in the same transaction, and the relay publishes the outbox to Kafka (Redpanda) with the
+key equal to the `aggregate_id`. Delivery is at-least-once: if the relay dies between
+publishing and marking, the message goes out again, and whoever consumes it is idempotent by
+version.
 
-Ainda não existem consumidor, projeção nem participante simulado: a instrução é aceita, vai
-para o tópico e fica em `accepted`. O plano completo está em
+There is still no consumer, projection or simulated participant: the instruction is accepted,
+goes to the topic and stays in `accepted`. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
-## Subir e testar em cinco minutos
+## Up and running in five minutes
 
-Requisitos: Docker (com Compose) e `make`. No Windows, use Git Bash ou WSL.
+Requirements: Docker (with Compose) and `make`. On Windows, use Git Bash or WSL.
 
 ```bash
-make up            # cria o .env com um JWT_SECRET aleatório e sobe Postgres, migrations, Redpanda, API e relay
-make demo-client   # cadastra o cliente "demo" e imprime o client_secret (uma única vez)
+make up            # creates .env with a random JWT_SECRET and brings up Postgres, migrations, Redpanda, API and relay
+make demo-client   # registers the "demo" client and prints the client_secret (exactly once)
 ```
 
-Com o `client_secret` em mãos:
+With the `client_secret` in hand:
 
 ```bash
-# 1. autenticar: devolve um token que vale 15 minutos
+# 1. authenticate: returns a token valid for 15 minutes
 curl -s localhost:8080/auth/token \
-  -d '{"client_id":"demo","client_secret":"<segredo>"}'
+  -d '{"client_id":"demo","client_secret":"<secret>"}'
 
-# 2. criar uma instrução (Idempotency-Key obrigatório, valor sempre em centavos)
+# 2. create an instruction (Idempotency-Key required, amount always in cents)
 curl -si localhost:8080/instructions \
-  -H "Authorization: Bearer <access_token>" -H "Idempotency-Key: minha-chave-1" \
+  -H "Authorization: Bearer <access_token>" -H "Idempotency-Key: my-key-1" \
   -d '{"debtor":"a","creditor":"b","amount_cents":15000,"end_to_end_id":"e2e-1"}'
 
-# 3. repetir o passo 2 devolve a mesma instrução, com o header Idempotent-Replayed: true
+# 3. repeating step 2 returns the same instruction, with the header Idempotent-Replayed: true
 
-# 4. consultar (estado reconstruído do event store, sem atraso)
+# 4. read it back (state rebuilt from the event store, with no lag)
 curl -s localhost:8080/instructions/<id> -H "Authorization: Bearer <access_token>"
 ```
 
-Para ver a instrução chegar ao Kafka:
+To see the instruction reach Kafka:
 
 ```bash
 docker compose exec redpanda rpk topic consume payrouter.instructions.events -n 5
 ```
 
-Para outro cliente: `make demo-client ID=loja-a`. Para acompanhar os logs: `make logs` (API)
-e `make logs-relay` (relay).
-Para parar: `make down` (acrescente `-v` ao `docker compose down` para apagar o banco).
+For another client: `make demo-client ID=store-a`. To follow the logs: `make logs` (API)
+and `make logs-relay` (relay).
+To stop: `make down` (add `-v` to `docker compose down` to delete the database).
 
-## Desenvolvimento
+## Development
 
 ```bash
-make db           # só o Postgres, para rodar a API com `go run ./cmd/api`
-make migrate-up   # aplica as migrations (o `make up` já faz isso)
-make test         # go test -race ./... (os testes de integração usam o Docker)
-make test-flake   # os testes de concorrência 20 vezes sob -race
+make db           # Postgres only, to run the API with `go run ./cmd/api`
+make migrate-up   # applies the migrations (`make up` already does this)
+make test         # go test -race ./... (the integration tests use Docker)
+make test-flake   # the concurrency tests 20 times under -race
 make lint
 ```
 
-Para rodar a API fora do Docker, exporte `DATABASE_URL`
-(`postgres://payrouter:payrouter@localhost:5432/payrouter?sslmode=disable`) e `JWT_SECRET`
-(o valor do `.env`) e use `go run ./cmd/api`. Clientes: `go run ./cmd/clientctl create <id>`.
+To run the API outside Docker, export `DATABASE_URL`
+(`postgres://payrouter:payrouter@localhost:5432/payrouter?sslmode=disable`) and `JWT_SECRET`
+(the value from `.env`) and use `go run ./cmd/api`. Clients: `go run ./cmd/clientctl create <id>`.
 
 ## API
 
-| Rota | Resposta |
+| Route | Response |
 |---|---|
-| `POST /auth/token` | `200` com `access_token`; `401 invalid_credentials` igual para cliente inexistente, segredo errado e cliente inativo |
-| `POST /instructions` | `202` com `Location`; repetição da mesma chave devolve a mesma resposta com `Idempotent-Replayed: true`; a mesma chave com outro corpo é `422` |
-| `GET /instructions/{id}` | `200`, `404` se não existir, `400` se o id não for UUID |
-| `GET /healthz`, `GET /readyz` | sondas públicas, veja abaixo |
+| `POST /auth/token` | `200` with `access_token`; `401 invalid_credentials`, identical for an unknown client, a wrong secret and an inactive client |
+| `POST /instructions` | `202` with `Location`; repeating the same key returns the same response with `Idempotent-Replayed: true`; the same key with a different body is `422` |
+| `GET /instructions/{id}` | `200`, `404` if it does not exist, `400` if the id is not a UUID |
+| `GET /healthz`, `GET /readyz` | public probes, see below |
 
-Erros têm sempre o formato `{"error":{"code":"...","message":"..."}}`. Token ausente,
-inválido ou expirado dá `401` com `WWW-Authenticate: Bearer`: o cliente autentica de novo.
-Um token já emitido vale até expirar mesmo se o cliente for desativado
-(`clientctl deactivate`), no máximo 15 minutos.
+Errors always have the format `{"error":{"code":"...","message":"..."}}`. A missing,
+invalid or expired token gives `401` with `WWW-Authenticate: Bearer`: the client authenticates again.
+An already issued token is valid until it expires even if the client is deactivated
+(`clientctl deactivate`), at most 15 minutes.
 
-### Configuração
+### Configuration
 
-| Variável | Padrão | Efeito |
+| Variable | Default | Effect |
 |---|---|---|
-| `DATABASE_URL` | (obrigatória) | conexão com o Postgres |
-| `JWT_SECRET` | (obrigatória) | assina os tokens; no mínimo 32 bytes |
-| `ADDR` | `:8080` | endereço de escuta |
-| `LOG_FORMAT` | `json` | `text` escreve logs legíveis no terminal |
-| `REQUEST_TIMEOUT` | `5s` | prazo de cada requisição, repassado ao Postgres pelo contexto |
+| `DATABASE_URL` | (required) | Postgres connection |
+| `JWT_SECRET` | (required) | signs the tokens; at least 32 bytes |
+| `ADDR` | `:8080` | listen address |
+| `LOG_FORMAT` | `json` | `text` writes human-readable logs to the terminal |
+| `REQUEST_TIMEOUT` | `5s` | deadline of each request, passed on to Postgres through the context |
 
-### Observabilidade e prazos
+### Observability and deadlines
 
-- **Correlation ID**: o header `X-Correlation-ID` do cliente é reaproveitado se tiver até 64
-  caracteres de `[A-Za-z0-9._-]`; senão o servidor gera um UUID. Ele volta em toda resposta
-  (inclusive erros) e aparece em todo log da requisição.
-- **Log de acesso**: uma linha por requisição com `method`, `route` (o padrão, como
-  `GET /instructions/{id}`), `status`, `duration_ms` e `client_id`. Nunca grava token, corpo
-  nem valores.
-- **Prazo estourado**: `504 request_timeout`, com o resultado desconhecido. Cliente que
-  desiste da conexão vira `499` nos logs.
-- **Sondas** (públicas, sem log de acesso): `GET /healthz` diz se o processo está vivo e
-  nunca consulta o banco; `GET /readyz` pinga o Postgres (limite de 2 s) e responde `503`,
-  sem detalhe no corpo, se ele não responde.
-- **Prazos do servidor**: `ReadHeaderTimeout` 5 s, `ReadTimeout` 10 s, `WriteTimeout` 15 s
-  (maior que o prazo da requisição, para o 504 caber), `IdleTimeout` 60 s; pool com
-  `ConnectTimeout` 5 s e conexões renovadas a cada 30 min.
+- **Correlation ID**: the client's `X-Correlation-ID` header is reused if it has up to 64
+  characters from `[A-Za-z0-9._-]`; otherwise the server generates a UUID. It comes back in every
+  response (errors included) and appears in every log line of the request.
+- **Access log**: one line per request with `method`, `route` (the pattern, such as
+  `GET /instructions/{id}`), `status`, `duration_ms` and `client_id`. It never records the token,
+  the body or amounts.
+- **Deadline exceeded**: `504 request_timeout`, with an unknown result. A client that
+  gives up the connection shows as `499` in the logs.
+- **Probes** (public, no access log): `GET /healthz` says whether the process is alive and
+  never queries the database; `GET /readyz` pings Postgres (2 s limit) and answers `503`,
+  with no detail in the body, if it does not respond.
+- **Server deadlines**: `ReadHeaderTimeout` 5 s, `ReadTimeout` 10 s, `WriteTimeout` 15 s
+  (larger than the request deadline so the 504 fits), `IdleTimeout` 60 s; pool with
+  `ConnectTimeout` 5 s and connections renewed every 30 min.
 
-### Desligamento
+### Shutdown
 
-Ao receber `SIGINT` ou `SIGTERM` (`docker stop`), a API para de aceitar conexões, espera as
-requisições em andamento por até 10 s e só então fecha o pool do Postgres. Uma requisição que
-não termina nesse prazo é cortada, e para o cliente isso é o mesmo resultado desconhecido do
-`504`: repete com a mesma `Idempotency-Key`. Um segundo sinal derruba o processo na hora.
+On receiving `SIGINT` or `SIGTERM` (`docker stop`), the API stops accepting connections, waits for
+in-flight requests for up to 10 s and only then closes the Postgres pool. A request that
+does not finish within that deadline is cut, and for the client that is the same unknown
+result as the `504`: retry with the same `Idempotency-Key`. A second signal kills the process immediately.
 
-## Limitações conhecidas (v1)
+## Known limitations (v1)
 
-- A instrução fica em `accepted`: o relay a publica no Kafka, mas ainda não há processor nem
-  participante (sessões 11 e 12).
-- Entrega at-least-once: o mesmo evento pode aparecer duas vezes no tópico depois da queda do
-  relay. Ainda não há consumidor; quando houver, ele descarta o que já viu pela versão.
-- O outbox publicado não é apagado: não há rotina de limpeza ainda.
-- Token sem refresh e sem revogação antes de expirar; sem rate limit no `/auth/token`.
-- Sem TLS: pensado para rodar atrás de um proxy ou só em rede local.
-- Segredos de desenvolvimento do Postgres estão no `docker-compose.yml`; não use fora do
-  ambiente local.
+- The instruction stays in `accepted`: the relay publishes it to Kafka, but there is still no
+  processor or participant (sessions 11 and 12).
+- At-least-once delivery: the same event can appear twice in the topic after the relay
+  dies. There is no consumer yet; when there is one, it will discard what it has already seen by version.
+- Published outbox rows are not deleted: there is no cleanup routine yet.
+- Token without refresh and without revocation before it expires; no rate limit on `/auth/token`.
+- No TLS: meant to run behind a proxy or only on a local network.
+- The Postgres development secrets are in `docker-compose.yml`; do not use them outside the
+  local environment.
 
-## Documentação
+## Documentation
 
-- [`docs/escope.md`](docs/escope.md): objetivo, escopo, agregado, modelo de dados, decisões e experimentos
-- [`docs/executionPlan.md`](docs/executionPlan.md): fases, sessões, riscos e perguntas de defesa
-- [`docs/commitpattern.md`](docs/commitpattern.md): padrão das mensagens de commit
+- [`docs/escope.md`](docs/escope.md): objective, scope, aggregate, data model, decisions and experiments
+- [`docs/executionPlan.md`](docs/executionPlan.md): phases, sessions, risks and defense questions
+- [`docs/commitpattern.md`](docs/commitpattern.md): commit message pattern

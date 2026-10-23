@@ -1,177 +1,177 @@
-# payrouter — Roteador de instruções de pagamento com estado desconhecido
+# payrouter — Payment instruction router with an unknown state
 
-> Documento de escopo. Companheiro do plano de execução. Nome de trabalho; troque se
-> quiser.
-
----
-
-## 1. Objetivo
-
-### O que o sistema é
-
-Um serviço que recebe instruções de pagamento, roteia cada uma para um participante
-externo e trata **o estado desconhecido como estado de primeira classe**: quando o envio
-dá timeout, o sistema não sabe se a operação aconteceu, registra essa incerteza e a
-resolve ativamente por conciliação.
-
-Essa frase vai no topo do README. Tudo que não a sustenta está fora do escopo.
-
-### A tese, e por que ela é diferente da do projeto anterior
-
-O [wallet-go](https://github.com/VictorM0nteiro/wallet-go-) prova correção **dentro** de
-uma transação: lock, invariante de soma zero, rollback, tudo ou nada. É a razão pela qual
-ele é forte, e é também o seu limite declarado.
-
-Este projeto prova correção **quando a transação não existe mais**. Não há `ROLLBACK` que
-desfaça uma mensagem enviada para outro sistema; não há `COMMIT` que torne dois
-consumidores consistentes no mesmo instante. O que sobra são decisões defensáveis sobre
-incerteza, e é isso que o projeto documenta.
-
-Se a tese fosse a mesma do wallet-go, o segundo projeto seria redundante. A régua para
-qualquer adição aqui: **isso só existe porque a fronteira é assíncrona?** Se a resposta
-for não, provavelmente é repetição.
-
-### Event sourcing em cinco linhas
-
-O estado de uma instrução não é uma coluna que se atualiza. É a sequência de eventos que
-aconteceram com ela, gravados em ordem e nunca editados. O estado atual é obtido
-*reconstruindo*: parte do zero e aplica cada evento na ordem.
-
-Três consequências que o projeto explora:
-
-1. **O histórico é a informação, não um subproduto.** "Esta instrução foi tentada três
-   vezes, deu timeout nas duas primeiras e o participante confirmou na consulta de status"
-   é uma pergunta que um campo `status` não responde e uma sequência de eventos responde
-   sem esforço.
-2. **Projeções são descartáveis.** Qualquer visão de leitura é função pura dos eventos, e
-   portanto pode ser jogada fora e reconstruída. Isso é o que torna um bug de projeção
-   recuperável em vez de permanente.
-3. **Efeito colateral não pode morar na projeção.** Se o envio da mensagem fosse feito ao
-   processar um evento, uma reconstrução reenviaria tudo. É a decisão que organiza a
-   arquitetura inteira (ADR 2).
-
-### O problema do estado desconhecido
-
-Você envia a instrução ao participante e o socket expira. Do seu lado, dois mundos são
-indistinguíveis:
-
-- a mensagem não chegou, e nada aconteceu
-- a mensagem chegou, foi processada, e só a resposta se perdeu
-
-Não existe informação local que separe os dois. Responder "falhou" ao cliente pode ser
-mentira — e, num sistema de pagamento, é a mentira cara. Responder "deu certo" também.
-
-A única saída honesta é um terceiro estado: `unknown`. E o que define a qualidade do
-sistema é o que ele faz com esse estado, porque `unknown` **não se resolve sozinho**.
-
-### O que o projeto prova
-
-Que você sabe desenhar um agregado event-sourced com concorrência otimista; manter um
-consumidor correto sob entrega at-least-once e reordenação; separar efeito colateral de
-projeção para que replay seja seguro; resolver incerteza por conciliação em vez de
-chutar; e medir o custo da consistência eventual em vez de afirmá-lo.
+> Scope document. Companion to the execution plan. Working name; change it if you
+> want.
 
 ---
 
-## 2. Escopo
+## 1. Objective
 
-### Dentro
+### What the system is
 
-- Recebimento e validação de instruções de pagamento, com `Idempotency-Key`
-- Event store em Postgres com concorrência otimista por versão de agregado
-- Outbox transacional e relay publicando no Kafka
-- Roteamento assíncrono para um participante externo simulado
-- Tratamento de timeout: estado `unknown` e conciliação ativa com backoff
-- Projeção de documento em MongoDB, com consumidor idempotente
-- Cache de status em Redis
-- Replay completo de projeção
-- Observabilidade com OpenTelemetry e as quatro medições da seção 7
-- Participante simulado com comportamento configurável, incluindo mentir
-- Rate limit **de saída** para o participante, com backpressure no consumidor
-- Rate limit de entrada por cliente (portado do wallet-go, declarado como reaproveitamento)
-- **Worker pool elástico** no processor e **pool de conexões elástico** para o participante,
-  ambos preservando a ordem por `aggregate_id` (decisão 10)
+A service that receives payment instructions, routes each one to an external participant
+and treats **the unknown state as a first-class state**: when a send times out, the system
+does not know whether the operation happened, records that uncertainty and actively
+resolves it through reconciliation.
 
-### Fora (deliberadamente)
+That sentence goes at the top of the README. Anything that does not support it is out of scope.
 
-- Ledger, saldo, partidas dobradas — isso é o wallet-go, e repetir desperdiça o projeto
-- Integração com SPI, Bacen, Dict ou qualquer sistema real
-- Autenticação além de client_id + segredo trocados por um JWT curto (15 min, sem refresh, sem revogação, sem OAuth completo nem papéis)
-- Multi-moeda, agendamento, instrução recorrente
-- Frontend de qualquer tipo
-- Saga com compensação entre múltiplos agregados
-- Kubernetes, service mesh, nuvem (fila de extras)
+### The thesis, and why it differs from the previous project's
 
-**Regra de escopo:** diante de "adiciono uma feature ou aprofundo o que existe",
-aprofunde. Um fluxo medido e documentado vale mais que cinco endpoints.
+[wallet-go](https://github.com/VictorM0nteiro/wallet-go-) proves correctness **inside** a
+transaction: lock, zero-sum invariant, rollback, all or nothing. That is why it is strong,
+and it is also its declared limit.
+
+This project proves correctness **when the transaction no longer exists**. There is no
+`ROLLBACK` that undoes a message sent to another system; there is no `COMMIT` that makes
+two consumers consistent at the same instant. What is left are defensible decisions under
+uncertainty, and that is what the project documents.
+
+If the thesis were the same as wallet-go's, the second project would be redundant. The
+yardstick for any addition here: **does this only exist because the boundary is
+asynchronous?** If the answer is no, it is probably repetition.
+
+### Event sourcing in five lines
+
+The state of an instruction is not a column that gets updated. It is the sequence of events
+that happened to it, stored in order and never edited. The current state is obtained by
+*rebuilding*: start from zero and apply each event in order.
+
+Three consequences the project explores:
+
+1. **The history is the information, not a by-product.** "This instruction was attempted
+   three times, timed out on the first two and the participant confirmed on the status
+   query" is a question a `status` field cannot answer and a sequence of events answers
+   effortlessly.
+2. **Projections are disposable.** Any read view is a pure function of the events, and so
+   it can be thrown away and rebuilt. That is what makes a projection bug recoverable
+   instead of permanent.
+3. **A side effect cannot live in the projection.** If the message were sent while
+   processing an event, a rebuild would resend everything. It is the decision that organizes
+   the whole architecture (ADR 2).
+
+### The unknown-state problem
+
+You send the instruction to the participant and the socket times out. From your side, two
+worlds are indistinguishable:
+
+- the message did not arrive, and nothing happened
+- the message arrived, was processed, and only the response was lost
+
+No local information separates the two. Telling the client "it failed" can be a lie — and,
+in a payment system, it is the expensive lie. Telling them "it worked" is one too.
+
+The only honest way out is a third state: `unknown`. And what defines the quality of the
+system is what it does with that state, because `unknown` **does not resolve itself**.
+
+### What the project proves
+
+That you know how to design an event-sourced aggregate with optimistic concurrency; keep a
+consumer correct under at-least-once delivery and reordering; separate side effects from
+projection so that replay is safe; resolve uncertainty by reconciliation instead of
+guessing; and measure the cost of eventual consistency instead of asserting it.
 
 ---
 
-## 3. O agregado
+## 2. Scope
 
-Uma `PaymentInstruction`. Toda a complexidade do projeto cabe no ciclo de vida dela.
+### In
 
-### Máquina de estados
+- Receiving and validating payment instructions, with an `Idempotency-Key`
+- Event store in Postgres with optimistic concurrency by aggregate version
+- Transactional outbox and a relay publishing to Kafka
+- Asynchronous routing to a simulated external participant
+- Timeout handling: the `unknown` state and active reconciliation with backoff
+- Document projection in MongoDB, with an idempotent consumer
+- Status cache in Redis
+- Full projection replay
+- Observability with OpenTelemetry and the four measurements of section 7
+- Simulated participant with configurable behavior, including lying
+- **Output** rate limit toward the participant, with backpressure on the consumer
+- Per-client input rate limit (ported from wallet-go, declared as reuse)
+- **Elastic worker pool** in the processor and **elastic connection pool** toward the
+  participant, both preserving order per `aggregate_id` (decision 10)
+
+### Out (deliberately)
+
+- Ledger, balance, double entry — that is wallet-go, and repeating it wastes the project
+- Integration with SPI, Bacen, Dict or any real system
+- Authentication beyond client_id + secret exchanged for a short JWT (15 min, no refresh, no revocation, no full OAuth or roles)
+- Multi-currency, scheduling, recurring instructions
+- A frontend of any kind
+- Saga with compensation across multiple aggregates
+- Kubernetes, service mesh, cloud (extras queue)
+
+**Scope rule:** when facing "do I add a feature or deepen what exists", deepen. One
+measured, documented flow is worth more than five endpoints.
+
+---
+
+## 3. The aggregate
+
+One `PaymentInstruction`. All of the project's complexity fits in its lifecycle.
+
+### State machine
 
 ```
          accepted
-             │ roteia
+             │ route
              ▼
          in_flight ──────┬──────────┐
              │           │          │
-       resposta ok   rejeitada   timeout
+        ok response   rejected    timeout
              │           │          │
              ▼           ▼          ▼
           settled    rejected    unknown
                                     │
-              consulta de status (StatusQueried, registra)
+              status query (StatusQueried, records)
                        ┌────────────┼────────────┐
                        ▼            ▼            ▼
                    settled      rejected      unknown
-                                           (reagenda; após N
-                                            tentativas, failed
-                                            com intervenção
-                                            manual registrada)
+                                           (reschedules; after N
+                                            attempts, failed
+                                            with manual
+                                            intervention recorded)
 ```
 
-`settled`, `rejected` e `failed` são terminais. `unknown` é o único estado que exige
-trabalho de fundo para sair de si mesmo.
+`settled`, `rejected` and `failed` are terminal. `unknown` is the only state that requires
+background work to leave itself.
 
-Há um quarto caminho de saída de `in_flight` que o diagrama acima omite para não poluir:
-o participante responder `429`. Isso **volta** a instrução para `accepted`, aguardando
-nova tentativa, e é o oposto do timeout — `429` significa definitivamente não processado,
-então reenviar é seguro. No caminho normal isso não deveria acontecer, porque o rate limit
-de saída se autolimita antes; quando acontece, significa que o limite está mal
-configurado, e o evento registra isso.
+There is a fourth way out of `in_flight` that the diagram above omits to keep it clean: the
+participant answering `429`. That **returns** the instruction to `accepted`, awaiting a new
+attempt, and it is the opposite of a timeout — `429` means definitely not processed, so
+resending is safe. On the normal path this should not happen, because the output rate limit
+limits itself beforehand; when it does, it means the limit is misconfigured, and the event
+records that.
 
-### Eventos
+### Events
 
-| Evento | Significado | Transição |
+| Event | Meaning | Transition |
 |---|---|---|
-| `InstructionAccepted` | Validada e persistida, nada enviado | → `accepted` |
-| `RoutingAttempted` | Mensagem despachada ao participante | → `in_flight` |
-| `ParticipantAccepted` | Participante confirmou (na resposta ou descoberto na conciliação) | `in_flight` ou `unknown` → `settled` |
-| `ParticipantRejected` | Participante negou, com código (idem) | `in_flight` ou `unknown` → `rejected` |
-| `RoutingTimedOut` | Sem resposta no prazo | → `unknown` |
-| `StatusQueried` | Consulta de conciliação feita, com o resultado | `unknown` → `unknown` (só registra) |
-| `RoutingThrottled` | Participante devolveu `429`, nada foi processado | → `accepted` |
-| `ReconciliationExhausted` | N consultas sem conclusão | → `failed` |
+| `InstructionAccepted` | Validated and persisted, nothing sent | → `accepted` |
+| `RoutingAttempted` | Message dispatched to the participant | → `in_flight` |
+| `ParticipantAccepted` | Participant confirmed (in the response or discovered during reconciliation) | `in_flight` or `unknown` → `settled` |
+| `ParticipantRejected` | Participant denied, with a code (same) | `in_flight` or `unknown` → `rejected` |
+| `RoutingTimedOut` | No response within the deadline | → `unknown` |
+| `StatusQueried` | Reconciliation query made, with the result | `unknown` → `unknown` (only records) |
+| `RoutingThrottled` | Participant returned `429`, nothing was processed | → `accepted` |
+| `ReconciliationExhausted` | N queries without a conclusion | → `failed` |
 
-Oito eventos. Transição ilegal é rejeitada **no domínio**, com erro tipado — não por
-constraint de banco, não por `if` espalhado no handler.
+Eight events. An illegal transition is rejected **in the domain**, with a typed error — not
+by a database constraint, not by an `if` scattered through the handler.
 
-`StatusQueried` nunca muda o estado: registra a consulta e o que o participante
-respondeu. Quem resolve é `ParticipantAccepted` ou `ParticipantRejected`, emitido logo
-depois quando a consulta é conclusiva. São dois fatos separados ("consultei" e
-"resolvi"), o que mantém a conciliação auditável e bate com a linha do tempo do
-documento Mongo da seção 4.
+`StatusQueried` never changes the state: it records the query and what the participant
+answered. What resolves is `ParticipantAccepted` or `ParticipantRejected`, emitted right
+after when the query is conclusive. They are two separate facts ("I queried" and "I
+resolved"), which keeps reconciliation auditable and matches the timeline of the Mongo
+document in section 4.
 
 ---
 
-## 4. Modelo de dados
+## 4. Data model
 
 ```sql
--- O event store. Fonte única da verdade.
+-- The event store. Single source of truth.
 CREATE TABLE events (
     id              BIGSERIAL PRIMARY KEY,
     aggregate_id    UUID    NOT NULL,
@@ -185,7 +185,7 @@ CREATE TABLE events (
 
 CREATE INDEX events_aggregate_idx ON events (aggregate_id, version);
 
--- Outbox transacional: gravado na MESMA transação do evento.
+-- Transactional outbox: written in the SAME transaction as the event.
 CREATE TABLE outbox (
     id            BIGSERIAL PRIMARY KEY,
     event_id      BIGINT NOT NULL REFERENCES events(id),
@@ -198,7 +198,7 @@ CREATE TABLE outbox (
 
 CREATE INDEX outbox_pending_idx ON outbox (id) WHERE published_at IS NULL;
 
--- Fila de trabalho do process manager.
+-- Work queue of the process manager.
 CREATE TABLE reconciliation_tasks (
     aggregate_id     UUID PRIMARY KEY,
     attempts         INT  NOT NULL DEFAULT 0,
@@ -208,7 +208,7 @@ CREATE TABLE reconciliation_tasks (
 
 CREATE INDEX reconciliation_due_idx ON reconciliation_tasks (next_attempt_at);
 
--- Idempotência do lado de comando. Mesmo contrato do wallet-go.
+-- Command-side idempotency. Same contract as wallet-go.
 CREATE TABLE idempotency_keys (
     scope                TEXT NOT NULL,
     endpoint             TEXT NOT NULL,
@@ -223,28 +223,28 @@ CREATE TABLE idempotency_keys (
 );
 ```
 
-### Invariantes testadas no CI
+### Invariants tested in CI
 
 ```sql
--- 1. Versões de um agregado são contíguas a partir de 1, sem buraco.
+-- 1. An aggregate's versions are contiguous from 1, with no gap.
 SELECT aggregate_id
 FROM events
 GROUP BY aggregate_id
 HAVING COUNT(*) <> MAX(version) OR MIN(version) <> 1;
 
--- 2. Todo evento tem exatamente uma linha de outbox.
+-- 2. Every event has exactly one outbox row.
 SELECT e.id FROM events e
 LEFT JOIN outbox o ON o.event_id = e.id
 GROUP BY e.id
 HAVING COUNT(o.id) <> 1;
 ```
 
-Ambas devem retornar zero linhas, sempre.
+Both must return zero rows, always.
 
-### Projeção em MongoDB
+### Projection in MongoDB
 
-Documento por instrução. A linha do tempo aninhada é o que justifica documento em vez de
-tabela: ela é lida junto com o resto, nunca consultada em separado.
+One document per instruction. The nested timeline is what justifies a document instead of
+a table: it is read together with the rest, never queried separately.
 
 ```json
 {
@@ -267,104 +267,103 @@ tabela: ela é lida junto com o resto, nunca consultada em separado.
 }
 ```
 
-`version` no documento é o mecanismo de idempotência do consumidor (ADR 3).
+The `version` in the document is the consumer's idempotency mechanism (ADR 3).
 
-### Cache em Redis
+### Cache in Redis
 
-`status:<aggregate_id>` → `{"status": "...", "version": N}`, com TTL. A versão viaja no
-valor para que o cliente consiga detectar defasagem em vez de confiar cegamente.
-
----
-
-## 5. Decisões já travadas
-
-**1. Concorrência otimista por versão esperada.** Para gravar a versão 4, o comando
-afirma ter lido a versão 3. Se outro escreveu nesse meio, `UNIQUE (aggregate_id,
-version)` recusa e o comando relê e tenta de novo. Sem lock de linha, sem
-`SERIALIZABLE`.
-
-Isso fecha uma trilogia com o projeto anterior: lock pessimista, isolamento serializável
-e versão otimista são três respostas ao mesmo problema, e você sabe dizer quando cada uma
-cabe.
-
-**2. Efeito colateral vive no lado de comando, nunca na projeção.** Enviar ao participante
-é efeito externo. Projeções são função pura dos eventos e podem ser reconstruídas; o envio
-é reação a comando, não a replay.
-
-**3. Idempotência do consumidor é a versão, não uma tabela de deduplicação.** A projeção
-guarda `version` e descarta evento com versão menor ou igual. Custa um campo, cobre
-reentrega e reordenação com o mesmo mecanismo.
-
-**4. Partição do Kafka por `aggregate_id`.** Ordem garantida dentro de uma instrução, que
-é onde ela importa. Entre instruções diferentes não importa, e nenhuma ordenação global é
-imposta — dizer isso é mais forte que impor.
-
-**5. Leitura de um agregado é autoritativa; leitura de lista é eventual.**
-`GET /instructions/{id}` reconstrói do event store, o que para um agregado é barato.
-`GET /instructions?status=unknown` lê a projeção. Isso dissolve read-your-writes sem
-inventar máquina nenhuma, e fica explícito no contrato da API.
-
-**6. Entrega at-least-once, assumida.** O relay publica e só então marca `published_at`.
-Morrer no meio republica; a ordem inversa perderia evento. A consequência está no item 3.
-
-**7. O participante simulado é parte do sistema, não um mock.** Processo próprio, com
-comportamento configurável por variável de ambiente: aceita, rejeita, demora, dá timeout,
-**responde depois do timeout** (o caso cruel: processou, mas você não soube) e cai. É o
-que torna a tese testável.
-
-**8. Dinheiro em `int64` de centavos.** Mesma regra do projeto anterior: nunca float, em
-nenhuma camada, nem em log, nem em JSON.
-
-**9. Rate limit de saída com backpressure, não descarte.** O participante tem um limite
-de TPS configurável. Quando a entrada excede esse limite, o processor **desacelera o
-consumo** — pausa a partição e não avança o offset — em vez de descartar mensagem ou
-acumular na memória. A consequência é que o lag cresce, e isso é correto: a instrução não
-se perde, ela espera.
-
-`429` e timeout exigem reações opostas, e essa é a distinção mais importante do projeto
-depois do próprio `unknown`: `429` é "definitivamente não processado", logo reenviar é
-seguro; timeout é "não sei", logo a única operação segura é consultar status. Duas falhas
-que parecem iguais no log e que não podem ser tratadas do mesmo jeito.
-
-O rate limit **de entrada** por cliente é o token bucket do wallet-go, portado. Fica
-declarado como reaproveitamento no README, porque não é contribuição deste projeto.
-
-**10. Concorrência elástica que nunca quebra a ordem por agregado.** O processor roteia
-em paralelo, mas dois eventos do mesmo `aggregate_id` jamais executam ao mesmo tempo nem
-fora de ordem. Isso só existe porque a fronteira é assíncrona: o paralelismo vem da
-chegada de mensagens independentes, e o limite vem do participante externo.
-
-- **Worker pool elástico** (`internal/elastic`, genérico): entre `min` e `max` goroutines,
-  cresce quando a fila interna e o tempo de espera sobem, encolhe com ociosidade, com
-  histerese para não oscilar. Despacho com afinidade por chave: o mesmo agregado cai
-  sempre na mesma lane enquanto tem trabalho em voo (mapa de chaves ativas), então
-  redimensionar o pool não reordena nada. O offset só avança até o **watermark
-  contíguo**: concluir a mensagem 7 antes da 5 não commita a 7.
-- **Pool de conexões elástico** para o participante: limite de requisições em voo
-  adaptativo (AIMD: aumento aditivo em sucesso, redução multiplicativa em timeout ou
-  `429`), mais `http.Transport` com `MaxConnsPerHost` acompanhando o limite atual.
-  Conexão ociosa é fechada após TTL. O teto é o rate limit de saída; o pool não o
-  substitui.
-- **Dimensionamento defensável (Lei de Little):** workers necessários ≈ TPS-alvo ×
-  latência p99 do participante. Medir isso, não chutar `max`.
-- **Postgres usa `pgxpool` estático**, dimensionado e medido. `pgxpool` não redimensiona
-  em runtime e reinventá-lo não agrega à tese; declarado como limitação.
-- Timeout ainda é "não sei": o pool nunca reenvia por conta própria. Redução do limite em
-  timeout é só controle de carga, e a instrução vai para `unknown` como sempre.
+`status:<aggregate_id>` → `{"status": "...", "version": N}`, with a TTL. The version
+travels in the value so the client can detect staleness instead of trusting blindly.
 
 ---
 
-## 6. Arquitetura
+## 5. Decisions already locked
 
-Hexagonal, na versão mínima, pelo mesmo motivo prático de sempre: o domínio precisa ser
-testável sem Kafka, sem Mongo e sem Docker.
+**1. Optimistic concurrency by expected version.** To write version 4, the command asserts
+it read version 3. If someone else wrote in between, `UNIQUE (aggregate_id, version)`
+refuses it and the command rereads and tries again. No row lock, no `SERIALIZABLE`.
+
+This closes a trilogy with the previous project: pessimistic lock, serializable isolation
+and optimistic version are three answers to the same problem, and you can say when each one
+fits.
+
+**2. A side effect lives on the command side, never in the projection.** Sending to the
+participant is an external effect. Projections are a pure function of the events and can be
+rebuilt; the send is a reaction to a command, not to a replay.
+
+**3. The consumer's idempotency is the version, not a deduplication table.** The
+projection stores `version` and discards an event with a lower or equal version. It costs
+one field and covers redelivery and reordering with the same mechanism.
+
+**4. Kafka partition by `aggregate_id`.** Order is guaranteed within one instruction, which
+is where it matters. Between different instructions it does not matter, and no global
+ordering is imposed — saying so is stronger than imposing one.
+
+**5. Reading one aggregate is authoritative; reading a list is eventual.**
+`GET /instructions/{id}` rebuilds from the event store, which for a single aggregate is
+cheap. `GET /instructions?status=unknown` reads the projection. This dissolves
+read-your-writes without inventing any machinery, and it is explicit in the API contract.
+
+**6. At-least-once delivery, assumed.** The relay publishes and only then marks
+`published_at`. Dying midway republishes; the reverse order would lose an event. The
+consequence is in item 3.
+
+**7. The simulated participant is part of the system, not a mock.** Its own process, with
+behavior configurable through environment variables: accepts, rejects, is slow, times out,
+**answers after the timeout** (the cruel case: it processed, but you did not find out) and
+goes down. It is what makes the thesis testable.
+
+**8. Money as `int64` cents.** Same rule as the previous project: never float, in any
+layer, not even in logs or JSON.
+
+**9. Output rate limit with backpressure, not dropping.** The participant has a
+configurable TPS limit. When input exceeds that limit, the processor **slows its
+consumption** — pauses the partition and does not advance the offset — instead of dropping
+a message or piling up in memory. The consequence is that lag grows, and that is correct:
+the instruction is not lost, it waits.
+
+`429` and timeout demand opposite reactions, and this is the most important distinction in
+the project after `unknown` itself: `429` is "definitely not processed", so resending is
+safe; timeout is "I don't know", so the only safe operation is to query the status. Two
+failures that look the same in the log and cannot be handled the same way.
+
+The per-client **input** rate limit is wallet-go's token bucket, ported. It is declared as
+reuse in the README, because it is not a contribution of this project.
+
+**10. Elastic concurrency that never breaks per-aggregate order.** The processor routes in
+parallel, but two events of the same `aggregate_id` never run at the same time or out of
+order. This only exists because the boundary is asynchronous: the parallelism comes from the
+arrival of independent messages, and the limit comes from the external participant.
+
+- **Elastic worker pool** (`internal/elastic`, generic): between `min` and `max`
+  goroutines, grows when the internal queue and the wait time rise, shrinks on idleness,
+  with hysteresis to avoid oscillating. Key-affinity dispatch: the same aggregate always
+  lands on the same lane while it has in-flight work (a map of active keys), so resizing the
+  pool reorders nothing. The offset only advances up to the **contiguous watermark**:
+  finishing message 7 before 5 does not commit 7.
+- **Elastic connection pool** toward the participant: an adaptive in-flight request limit
+  (AIMD: additive increase on success, multiplicative decrease on timeout or `429`), plus an
+  `http.Transport` with `MaxConnsPerHost` following the current limit. An idle connection
+  is closed after a TTL. The ceiling is the output rate limit; the pool does not replace it.
+- **Defensible sizing (Little's Law):** workers needed ≈ target TPS × the participant's p99
+  latency. Measure it, do not guess `max`.
+- **Postgres uses a static `pgxpool`**, sized and measured. `pgxpool` does not resize at
+  runtime and reinventing it adds nothing to the thesis; declared as a limitation.
+- A timeout is still "I don't know": the pool never resends on its own. Lowering the limit
+  on timeout is only load control, and the instruction goes to `unknown` as usual.
+
+---
+
+## 6. Architecture
+
+Hexagonal, in its minimal version, for the same practical reason as always: the domain must
+be testable without Kafka, without Mongo and without Docker.
 
 ```
   POST /instructions
   GET  /instructions/{id}        ┌──────────────┐
-  GET  /instructions?...    ───▶ │     api      │  comando + leitura autoritativa
+  GET  /instructions?...    ───▶ │     api      │  command + authoritative read
                                  └──────┬───────┘
-                                        │ uma transação SQL:
+                                        │ one SQL transaction:
                                         │ events + outbox
                                         ▼
                                  ┌──────────────┐
@@ -376,241 +375,241 @@ testável sem Kafka, sem Mongo e sem Docker.
                                  └──────┬───────┘
                                         ▼
                                    ┌─────────┐
-                                   │  Kafka  │  partição por aggregate_id
+                                   │  Kafka  │  partition by aggregate_id
                                    └────┬────┘
                         ┌───────────────┴───────────────┐
                         ▼                               ▼
                  ┌──────────────┐               ┌──────────────┐
                  │  processor   │               │  projector   │
-                 │ roteia +     │               │ Mongo +      │
-                 │ concilia     │               │ Redis        │
+                 │ routes +     │               │ Mongo +      │
+                 │ reconciles   │               │ Redis        │
                  └──────┬───────┘               └──────────────┘
                         │ HTTP
                         ▼
                  ┌──────────────┐
-                 │ participant  │  simulado, configurável, pode mentir
+                 │ participant  │  simulated, configurable, can lie
                  └──────────────┘
 ```
 
 ```
 cmd/
-  api/            HTTP: comando e leitura autoritativa
+  api/            HTTP: command and authoritative read
   relay/          outbox → Kafka
-  processor/      process manager: roteamento + conciliação (efeito colateral)
-  projector/      Kafka → Mongo + Redis (função pura, replayável)
-  participant/    participante simulado
-  loadtest/       harness de carga e medição
+  processor/      process manager: routing + reconciliation (side effect)
+  projector/      Kafka → Mongo + Redis (pure function, replayable)
+  participant/    simulated participant
+  loadtest/       load and measurement harness
 internal/
-  domain/         PaymentInstruction, eventos, máquina de estados, Money
-                  — zero import de pgx, net/http, kafka, mongo
-  app/            casos de uso + portas
-  elastic/        WorkerPool e ConnPool/limitador adaptativo, genéricos, sem
-                  dependência de Kafka ou HTTP — testáveis em isolamento
+  domain/         PaymentInstruction, events, state machine, Money
+                  — zero imports of pgx, net/http, kafka, mongo
+  app/            use cases + ports
+  elastic/        WorkerPool and ConnPool/adaptive limiter, generic, with no
+                  dependency on Kafka or HTTP — testable in isolation
   adapters/
-    http/         handlers, DTOs, erro de domínio → status
-    postgres/     event store, outbox, tasks, idempotência
+    http/         handlers, DTOs, domain error → status
+    postgres/     event store, outbox, tasks, idempotency
     kafka/        producer, consumer
-    mongo/        projeção
+    mongo/        projection
     redis/        cache
-    otel/         instrumentação
+    otel/         instrumentation
 ```
 
-**Teste de que a hexagonal não é decoração:** `go test ./internal/domain/...` roda em
-milissegundos e cobre a máquina de estados inteira, incluindo as transições ilegais, sem
-nenhum container.
+**Test that the hexagonal architecture is not decoration:** `go test ./internal/domain/...`
+runs in milliseconds and covers the whole state machine, illegal transitions included,
+without any container.
 
 ---
 
-## 7. Os experimentos
+## 7. The experiments
 
-Quatro medições, todas saindo de infraestrutura que o projeto constrói de qualquer forma.
+Four measurements, all coming out of infrastructure the project builds anyway.
 
-### 7.1 Lag da projeção
+### 7.1 Projection lag
 
-**A pergunta:** quanto tempo entre o commit do evento e a projeção refletir, sob carga, e
-como isso escala com o número de consumidores?
+**The question:** how long between the event commit and the projection reflecting it, under
+load, and how does that scale with the number of consumers?
 
-| Condição | Variável |
+| Condition | Variable |
 |---|---|
-| Consumidores | 1, 2, 4 |
-| Carga | taxa sustentada do harness, dois níveis |
+| Consumers | 1, 2, 4 |
+| Load | sustained harness rate, two levels |
 
-Registrar p50/p95/p99 do lag, throughput de eventos processados, e o ponto em que o
-consumidor deixa de acompanhar a produção.
+Record the lag p50/p95/p99, the throughput of processed events, and the point at which the
+consumer stops keeping up with production.
 
-### 7.2 Tempo de replay
+### 7.2 Replay time
 
-**A pergunta:** quanto custa reconstruir a projeção do zero, em função do número de
-eventos?
+**The question:** how much does it cost to rebuild the projection from zero, as a function
+of the number of events?
 
-Medir com 10k, 100k e 1M eventos. O resultado é a resposta honesta para "e se a projeção
-corromper?" — e é também a camada batch da seção 11.
+Measure with 10k, 100k and 1M events. The result is the honest answer to "what if the
+projection gets corrupted?" — and it is also the batch layer of section 11.
 
-### 7.3 Leitura em cache contra reconstrução
+### 7.3 Cached read against rebuild
 
-**A pergunta:** qual a latência de `GET /instructions/{id}` reconstruindo do event store,
-e quanto o cache de status economiza?
+**The question:** what is the latency of `GET /instructions/{id}` rebuilding from the event
+store, and how much does the status cache save?
 
-Registrar latência das duas vias e taxa de acerto do cache. Essa é a menos interessante
-das quatro e a primeira a cortar se o tempo apertar.
+Record the latency of both paths and the cache hit rate. This is the least interesting of
+the four and the first to cut if time gets tight.
 
-### 7.4 Saturação do participante
+### 7.4 Participant saturation
 
-**A pergunta:** quando a taxa de entrada excede o limite de saída, o sistema degrada de
-forma graciosa ou colapsa?
+**The question:** when the input rate exceeds the output limit, does the system degrade
+gracefully or collapse?
 
-| Condição | Variável |
+| Condition | Variable |
 |---|---|
-| Entrada | 50/s (no limite), 100/s, 200/s |
-| Limite de saída | fixo em 50/s |
-| Concorrência | pool fixo (1, 8, 32) contra pool elástico (min 1, max 32); rajada: 10s a 200/s entre períodos a 20/s |
+| Input | 50/s (at the limit), 100/s, 200/s |
+| Output limit | fixed at 50/s |
+| Concurrency | fixed pool (1, 8, 32) against elastic pool (min 1, max 32); burst: 10 s at 200/s between periods at 20/s |
 
-Registrar, além do abaixo: goroutines ativas ao longo do tempo, eventos de
-redimensionamento, p99 do roteamento e tempo até o pool encolher após a rajada. A
-hipótese a escrever antes: o elástico iguala o throughput do fixo grande com bem menos
-goroutines ociosas, ao custo de um pico de latência no início da rajada. Se o fixo grande
-ganhar sempre, a elasticidade não se justifica e o relatório diz isso.
+Record, besides what is below: active goroutines over time, resize events, routing p99 and
+the time until the pool shrinks after the burst. The hypothesis to write beforehand: the
+elastic pool matches the throughput of the large fixed pool with far fewer idle goroutines,
+at the cost of a latency spike at the start of the burst. If the large fixed pool always
+wins, elasticity is not justified and the report says so.
 
-Registrar: crescimento da fila de conciliação, lag da projeção, latência do `POST`
-(precisa continuar respondendo rápido — ele só grava evento), e se o consumidor recupera
-quando a entrada volta ao normal.
+Record: growth of the reconciliation queue, projection lag, `POST` latency (it must keep
+answering fast — it only writes an event), and whether the consumer recovers when input
+returns to normal.
 
-O resultado esperado é que o lag cresça de forma proporcional e nada se perca. Se alguma
-coisa se perder, o backpressure está errado, e descobrir isso medindo é melhor que
-descobrir numa pergunta de entrevista.
+The expected result is that lag grows proportionally and nothing is lost. If anything is
+lost, the backpressure is wrong, and finding that out by measuring beats finding it out in
+an interview question.
 
-**Metodologia, para as quatro:** hardware, SO, versões, parâmetros, semente e comando exato
-registrados. Reprodutibilidade é metade da credibilidade; a outra metade é explicar *por
-que* o número é o que é.
+**Methodology, for all four:** hardware, OS, versions, parameters, seed and the exact
+command recorded. Reproducibility is half of credibility; the other half is explaining
+*why* the number is what it is.
 
-E a lição do projeto anterior, já aprendida: gerador de carga, serviços e bancos
-competindo pela mesma máquina produzem ruído que pode exceder o efeito medido. Declare
-isso em "ameaças à validade" em vez de esconder.
+And the lesson from the previous project, already learned: the load generator, the services
+and the databases competing for the same machine produce noise that can exceed the measured
+effect. Declare that under "threats to validity" instead of hiding it.
 
 ---
 
-## 8. ADRs a escrever
+## 8. ADRs to write
 
-Arquivos curtos em `docs/adr/`: contexto, opções consideradas, decisão, consequências.
+Short files in `docs/adr/`: context, options considered, decision, consequences.
 
-| # | Decisão | O que defender |
+| # | Decision | What to defend |
 |---|---|---|
-| 1 | Event sourcing em vez de coluna de status | O histórico de tentativas é a informação. **Custo assumido:** leitura de um agregado vira reconstrução |
-| 2 | Efeito colateral fora da projeção | Sem isso, replay reenvia mensagem. É o que torna projeção descartável |
-| 3 | Idempotência do consumidor por versão | Cobre reentrega e reordenação com um campo, em vez de tabela de deduplicação |
-| 4 | Concorrência otimista por versão esperada | Comparar com lock pessimista e `SERIALIZABLE` do projeto anterior: quando cada um cabe |
-| 5 | `unknown` como estado de primeira classe | Timeout não é falha. Responder "falhou" sem saber é a mentira cara num sistema de pagamento |
-| 6 | Partição por `aggregate_id`, sem ordem global | Ordem onde importa, e nada além. Por que ordenação global seria custo sem benefício |
-| 7 | Leitura de agregado autoritativa, lista eventual | Dissolve read-your-writes sem máquina extra; o contrato fica honesto |
-| 8 | At-least-once em vez de at-most-once | Publicar antes de marcar. A alternativa perde evento, que é pior que duplicar |
-| 9 | Backpressure em vez de descarte no limite de saída | Instrução de pagamento não se descarta: ela espera. E por que `429` e timeout, que parecem a mesma falha, exigem reações opostas |
-| 10 | Pools elásticos com serialização por agregado | Paralelismo sem quebrar a ordem: afinidade por chave + watermark de offset. Por que `pgxpool` ficou estático. Quando elasticidade não compensa |
+| 1 | Event sourcing instead of a status column | The history of attempts is the information. **Assumed cost:** reading one aggregate becomes a rebuild |
+| 2 | Side effect outside the projection | Without it, replay resends messages. It is what makes the projection disposable |
+| 3 | Consumer idempotency by version | Covers redelivery and reordering with one field, instead of a deduplication table |
+| 4 | Optimistic concurrency by expected version | Compare with the previous project's pessimistic lock and `SERIALIZABLE`: when each one fits |
+| 5 | `unknown` as a first-class state | A timeout is not a failure. Answering "failed" without knowing is the expensive lie in a payment system |
+| 6 | Partition by `aggregate_id`, no global order | Order where it matters, and nothing beyond. Why global ordering would be cost with no benefit |
+| 7 | Authoritative aggregate read, eventual list | Dissolves read-your-writes without extra machinery; the contract stays honest |
+| 8 | At-least-once instead of at-most-once | Publish before marking. The alternative loses an event, which is worse than duplicating |
+| 9 | Backpressure instead of dropping at the output limit | A payment instruction is not dropped: it waits. And why `429` and timeout, which look like the same failure, demand opposite reactions |
+| 10 | Elastic pools with per-aggregate serialization | Parallelism without breaking order: key affinity + offset watermark. Why `pgxpool` stayed static. When elasticity does not pay off |
 
-ADR 5 é o mais valioso. É o único que não tem resposta limpa, e é por isso que ele mostra
-julgamento em vez de conhecimento.
+ADR 5 is the most valuable. It is the only one without a clean answer, and that is why it
+shows judgment instead of knowledge.
 
 ---
 
 ## 9. Stack
 
 ```
-Linguagem   Go 1.25+
+Language    Go 1.25+
 HTTP        net/http + chi
 Event store PostgreSQL 16 · pgx/v5 · golang-migrate
-Mensageria  Kafka · franz-go (ou segmentio/kafka-go)
-Projeção    MongoDB · mongo-driver
+Messaging   Kafka · franz-go (or segmentio/kafka-go)
+Projection  MongoDB · mongo-driver
 Cache       Redis · go-redis
-Testes      testify · testcontainers-go · go test -race
+Tests       testify · testcontainers-go · go test -race
 Observab.   OpenTelemetry · Prometheus · Grafana · log/slog
-Carga       harness próprio em Go
-Perfil      go test -bench -benchmem · pprof
+Load        in-house harness in Go
+Profiling   go test -bench -benchmem · pprof
 Infra       Docker · Docker Compose
 CI          GitHub Actions · golangci-lint
 ```
 
-Biblioteca padrão sempre que a diferença for pequena. Sobre observabilidade: OTel é neutro
-de fornecedor e exporta para Datadog e New Relic — você pode dizer isso com verdade sem
-pagar nada.
+Standard library whenever the difference is small. On observability: OTel is vendor-neutral
+and exports to Datadog and New Relic — you can say that truthfully without paying anything.
 
 ---
 
-## 10. Estrutura do README final
+## 10. Structure of the final README
 
-1. Uma frase dizendo o que o sistema faz
-2. A tese, em três linhas: o que muda quando a transação acaba
-3. Diagrama de arquitetura e os cinco processos
-4. A máquina de estados, com destaque no `unknown`
-5. Primer de event sourcing em cinco linhas
-6. Decisões de design, com link para cada ADR
-7. Resultados de medição: as quatro tabelas e a metodologia
-8. Relatório de falha induzida: hipótese, observado, divergência
-9. Como rodar: `docker compose up` e os testes passando
-10. **Limitações conhecidas**
+1. One sentence saying what the system does
+2. The thesis, in three lines: what changes when the transaction ends
+3. Architecture diagram and the five processes
+4. The state machine, with `unknown` highlighted
+5. Event sourcing primer in five lines
+6. Design decisions, with a link to each ADR
+7. Measurement results: the four tables and the methodology
+8. Induced-failure report: hypothesis, observed, divergence
+9. How to run: `docker compose up` and the tests passing
+10. **Known limitations**
 
-O item 10 é o que mais impressiona, e aqui ele tem material de sobra: sem saga, sem
-multi-região, sem ordenação global, participante simulado e não real, conciliação sem
-escalonamento humano de verdade.
-
----
-
-## 11. Fila de extras
-
-Só depois de tudo acima, nesta ordem:
-
-1. **Camada batch na forma da Lambda Architecture** — reconstrução agendada por replay
-   completo como caminho autoritativo de correção, convivendo com a projeção incremental.
-   O replay já existe por conta do experimento 7.2; o extra é agendá-lo, comparar o
-   resultado das duas camadas e registrar a divergência quando houver. **Descrição
-   honesta:** "camada de reconstrução por replay mais camada incremental, na forma da
-   Lambda Architecture", mais a explicação de por que a Kappa a substituiu na prática
-2. **DLQ e envenenamento de mensagem** — evento que o consumidor não consegue processar
-   após N tentativas vai para tópico morto, com teste
-3. **Deploy em host único** com Terraform e Caddy
-4. **AWS gerenciado** — RDS, MSK ou Kafka em EC2, ElastiCache
-5. **Elasticsearch como terceira projeção** — busca por instrução; fecha o item que ficou
-   de fora da seleção
+Item 10 is the one that impresses most, and here it has plenty of material: no saga, no
+multi-region, no global ordering, a simulated and not a real participant, reconciliation
+without real human escalation.
 
 ---
 
-## 12. Como começar
+## 11. Extras queue
 
-A primeira sessão produz, nesta ordem:
+Only after everything above, in this order:
 
-1. Repositório, estrutura de pastas, CI com lint e teste rodando desde o primeiro commit
-2. `CLAUDE.md` com as regras invioláveis
-3. Migration 001 com `events`, `outbox`, `reconciliation_tasks` e `idempotency_keys`
-4. A máquina de estados no domínio, com os oito eventos e seus testes — **sem banco, sem
-   Kafka, sem nada**
+1. **Batch layer in the shape of the Lambda Architecture** — scheduled rebuild by full
+   replay as the authoritative correction path, coexisting with the incremental projection.
+   Replay already exists because of experiment 7.2; the extra is scheduling it, comparing the
+   result of the two layers and recording the divergence when there is one. **Honest
+   description:** "a rebuild layer by replay plus an incremental layer, in the shape of the
+   Lambda Architecture", plus the explanation of why Kappa replaced it in practice
+2. **DLQ and poison messages** — an event the consumer cannot process after N attempts goes
+   to a dead topic, with a test
+3. **Single-host deploy** with Terraform and Caddy
+4. **Managed AWS** — RDS, MSK or Kafka on EC2, ElastiCache
+5. **Elasticsearch as a third projection** — search by instruction; closes the item that was
+   left out of the selection
 
-Comece pelo domínio. A máquina de estados é a única parte do sistema que você precisa
-saber de cor para defender o projeto falando, e é a mais barata de construir.
 ---
 
-## 13. Cobertura das vagas-alvo
+## 12. How to start
 
-O projeto existe para capacitar para duas vagas: Software Engineer no Mercado Livre
-(Go + React + IA) e Pix na Stone (Go, Kafka, Postgres, event-driven). O mapeamento
-abaixo é honesto: o que o escopo cobre, o que cobre só na fila de extras e o que fica
-**deliberadamente de fora** (a regra de escopo manda aprofundar, não alargar).
+The first session produces, in this order:
 
-| Requisito das vagas | Onde está no projeto | Status |
+1. Repository, folder structure, CI with lint and tests running since the first commit
+2. `CLAUDE.md` with the inviolable rules
+3. Migration 001 with `events`, `outbox`, `reconciliation_tasks` and `idempotency_keys`
+4. The state machine in the domain, with the eight events and their tests — **without a
+   database, without Kafka, without anything**
+
+Start with the domain. The state machine is the only part of the system you need to know by
+heart to defend the project out loud, and it is the cheapest to build.
+
+---
+
+## 13. Coverage of the target job postings
+
+The project exists to qualify for two postings: Software Engineer at Mercado Livre
+(Go + React + AI) and Pix at Stone (Go, Kafka, Postgres, event-driven). The mapping below
+is honest: what the scope covers, what it covers only in the extras queue, and what stays
+**deliberately out** (the scope rule says deepen, do not widen).
+
+| Posting requirement | Where it is in the project | Status |
 |---|---|---|
-| Go: APIs, concorrência, testes | todo o projeto; concorrência otimista (S4); worker pool e pool de conexões elásticos (S18-19) | Coberto |
-| Microsserviços, sistemas assíncronos, mensageria (Kafka) | 5 processos, outbox, relay, consumidores | Coberto |
-| Event Sourcing, Arquitetura Hexagonal | agregado event-sourced, `internal/` hexagonal | Coberto |
-| CQRS | comando (Postgres) separado da leitura de lista (Mongo/Redis) | Coberto (ADR 7) |
-| Lambda Architecture | replay + projeção incremental | Extra 1 (§11) |
-| PostgreSQL / relacional | event store, outbox, tasks | Coberto (MySQL não; mesma família, declarar) |
-| NoSQL: MongoDB, Redis | projeção e cache | Coberto |
-| Elasticsearch | terceira projeção | Extra 5 (§11) |
-| Observabilidade (OTel, Prometheus, Grafana) | Fase F | Coberto (New Relic/Datadog: OTel exporta para ambos) |
-| Testes automatizados, CI | testcontainers, `-race`, GitHub Actions | Coberto (Azure DevOps não; pipeline equivalente) |
-| Resiliência, mercado financeiro, pagamentos | tese inteira: `unknown`, conciliação | Coberto |
-| Cloud (AWS/GCP) | Extras 3 e 4 (§11) | Extra |
-| React/TypeScript | — | **Fora** (§2 exclui frontend) |
-| IA: agentes, MCP, tools, function calling | — | **Fora** |
+| Go: APIs, concurrency, tests | the whole project; optimistic concurrency (S4); elastic worker pool and connection pool (S18-19) | Covered |
+| Microservices, asynchronous systems, messaging (Kafka) | 5 processes, outbox, relay, consumers | Covered |
+| Event Sourcing, Hexagonal Architecture | event-sourced aggregate, hexagonal `internal/` | Covered |
+| CQRS | command (Postgres) separated from list reads (Mongo/Redis) | Covered (ADR 7) |
+| Lambda Architecture | replay + incremental projection | Extra 1 (§11) |
+| PostgreSQL / relational | event store, outbox, tasks | Covered (MySQL not; same family, declare it) |
+| NoSQL: MongoDB, Redis | projection and cache | Covered |
+| Elasticsearch | third projection | Extra 5 (§11) |
+| Observability (OTel, Prometheus, Grafana) | Phase F | Covered (New Relic/Datadog: OTel exports to both) |
+| Automated tests, CI | testcontainers, `-race`, GitHub Actions | Covered (Azure DevOps not; equivalent pipeline) |
+| Resilience, financial market, payments | the whole thesis: `unknown`, reconciliation | Covered |
+| Cloud (AWS/GCP) | Extras 3 and 4 (§11) | Extra |
+| React/TypeScript | — | **Out** (§2 excludes a frontend) |
+| AI: agents, MCP, tools, function calling | — | **Out** |
 
-React e IA são requisitos centrais só da vaga do Mercado Livre e são outro projeto, não
-uma feature deste. Se for perseguir essa vaga, o caminho natural é um projeto pequeno
-à parte (um MCP Server em Go expondo `GET /instructions` e a consulta de status como
-tools), depois deste. Isso é decisão sua; nada aqui o inclui.
+React and AI are central requirements only of the Mercado Livre posting and are another
+project, not a feature of this one. If you go after that posting, the natural path is a
+small separate project (an MCP Server in Go exposing `GET /instructions` and the status
+query as tools), after this one. That is your decision; nothing here includes it.

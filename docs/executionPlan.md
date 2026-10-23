@@ -1,303 +1,305 @@
-# payrouter — Plano de execução
+# payrouter — Execution plan
 
-> Companheiro do documento de escopo. O escopo define **o que** e **por quê**; este define
-> **quando** e **como**. 33 sessões de ~2h30, ou ~21 semanas a 4h por semana.
+> Companion to the scope document. The scope defines **what** and **why**; this one defines
+> **when** and **how**. 33 sessions of ~2.5 h, or ~21 weeks at 4 h per week.
 
 ---
 
-## 1. Como trabalhar com o Claude Code neste projeto
+## 1. How to work with Claude Code on this project
 
-A lição do projeto anterior é concreta e vale repetir aqui porque custou caro: a seção de
-análise do relatório de performance do wallet-go foi redigida pelo Claude, e isso virou
-uma limitação declarada no README. O texto estava correto; o problema é que a conclusão
-que o projeto existia para você defender não era sua.
+The lesson from the previous project is concrete and worth repeating here because it was
+expensive: the analysis section of wallet-go's performance report was written by Claude, and
+that became a declared limitation in the README. The text was correct; the problem is that
+the conclusion the project existed for you to defend was not yours.
 
-Neste projeto a regra é a mesma, com uma frente a mais de atenção: **arquitetura
-assíncrona é fácil de gerar e difícil de defender.** Um agente escreve um consumidor
-idempotente em quatro minutos. Explicar por que a idempotência é por versão e não por
-tabela de deduplicação, sob pergunta, é outra coisa.
+On this project the rule is the same, with one more front to watch: **asynchronous
+architecture is easy to generate and hard to defend.** An agent writes an idempotent consumer
+in four minutes. Explaining, under questioning, why idempotency is by version and not by a
+deduplication table is another matter.
 
-### Delegue sem culpa
+### Delegate without guilt
 
-Boilerplate de adapter, DTOs, scaffolding de teste table-driven, `docker-compose.yml`,
-Makefile, migrations, configuração de CI e lint, o participante simulado, o harness de
-carga, formatação de relatório, rascunho de ADR a partir de decisão que **você** já tomou.
+Adapter boilerplate, DTOs, table-driven test scaffolding, `docker-compose.yml`, the
+Makefile, migrations, CI and lint configuration, the simulated participant, the load
+harness, report formatting, an ADR draft from a decision that **you** already made.
 
-### Não delegue
+### Do not delegate
 
-- **`internal/domain/`** — a máquina de estados e a reconstrução do agregado. É o que a
-  entrevista cobra e é a parte mais barata de escrever à mão.
-- **A idempotência do consumidor e o controle de concorrência otimista.** São os dois
-  mecanismos centrais da tese.
-- **A afinidade por chave e o watermark de offset do worker pool.** É onde paralelismo
-  vira bug de ordem; o redimensionamento em si pode ser delegado, a invariante não.
-- **A decisão** de qualquer ADR. O Claude Code redige; a escolha é sua.
-- **A análise das quatro medições.** "Por que o lag cresce assim com 4 consumidores" é a
-  pergunta de entrevista inteira.
+- **`internal/domain/`** — the state machine and the aggregate rebuild. It is what the
+  interview asks about and it is the cheapest part to write by hand.
+- **The consumer's idempotency and the optimistic concurrency control.** They are the two
+  central mechanisms of the thesis.
+- **The key affinity and the offset watermark of the worker pool.** It is where parallelism
+  turns into an ordering bug; the resizing itself can be delegated, the invariant cannot.
+- **The decision** behind any ADR. Claude Code drafts; the choice is yours.
+- **The analysis of the four measurements.** "Why does the lag grow like this with 4
+  consumers" is the entire interview question.
 
-### A regra de aceitação
+### The acceptance rule
 
-Não faça commit de código que você não consiga explicar em dois minutos, em voz alta, sem
-olhar. Se não conseguir, peça a explicação antes de aceitar; se ainda não fechar,
-reescreva à mão.
+Do not commit code you cannot explain in two minutes, out loud, without looking. If you
+cannot, ask for the explanation before accepting it; if it still does not add up, rewrite
+it by hand.
 
-### `CLAUDE.md` na raiz
+### `CLAUDE.md` at the root
 
-Crie na sessão 1.
+Create it in session 1.
 
 ```markdown
 # payrouter
 
-Roteador de instruções de pagamento. Trata o estado desconhecido (timeout sem resposta)
-como estado de primeira classe, resolvido por conciliação ativa.
+Payment instruction router. It treats the unknown state (a timeout with no answer)
+as a first-class state, resolved by active reconciliation.
 
-## Tese
-Correção quando a transação não existe mais. Qualquer adição precisa passar no teste:
-isso só existe porque a fronteira é assíncrona?
+## Thesis
+Correctness when the transaction no longer exists. Any addition must pass the test:
+does this only exist because the boundary is asynchronous?
 
-## Regras invioláveis
-- `internal/domain/` não importa pgx, net/http, kafka, mongo nem redis.
-- Efeito colateral (enviar ao participante) vive no lado de comando, NUNCA na projeção.
-  Projeção é função pura dos eventos e tem que ser replayável.
-- Append no event store usa versão esperada; o conflito é o UNIQUE (aggregate_id, version).
-- Consumidor é idempotente pela versão do agregado, não por tabela de deduplicação.
-- Kafka particiona por aggregate_id. Nenhuma ordenação global é imposta.
-- GET de um agregado reconstrói do event store (autoritativo).
-  GET de lista lê a projeção (eventual). Está no contrato da API.
-- Transição ilegal de estado é erro tipado no domínio, não constraint de banco.
-- Dinheiro é int64 de centavos. Nunca float, nem em log, nem em JSON.
-- Relay publica e DEPOIS marca published_at. At-least-once, assumido.
-- No limite de saída, backpressure (pausa a partição), nunca descarte.
-- Pools elásticos (`internal/elastic`) nunca executam dois eventos do mesmo aggregate_id
-  ao mesmo tempo nem fora de ordem; offset só avança até o watermark contíguo.
-  Pool nunca reenvia por conta própria: reduzir limite em timeout é controle de carga.
-- 429 do participante = não processado, reenviar é seguro.
-  Timeout = não sei, a única operação segura é consultar status. Nunca confunda os dois.
+## Inviolable rules
+- `internal/domain/` does not import pgx, net/http, kafka, mongo or redis.
+- Side effects (sending to the participant) live on the command side, NEVER in the projection.
+  The projection is a pure function of the events and must be replayable.
+- Appending to the event store uses an expected version; the conflict is the UNIQUE (aggregate_id, version).
+- The consumer is idempotent by the aggregate version, not by a deduplication table.
+- Kafka partitions by aggregate_id. No global ordering is imposed.
+- GET of one aggregate rebuilds from the event store (authoritative).
+  GET of a list reads the projection (eventual). It is part of the API contract.
+- An illegal state transition is a typed error in the domain, not a database constraint.
+- Money is int64 cents. Never float, not even in logs or JSON.
+- The relay publishes and THEN marks published_at. At-least-once, assumed.
+- At the output limit, backpressure (pause the partition), never drop.
+- Elastic pools (`internal/elastic`) never run two events of the same aggregate_id
+  at the same time or out of order; the offset only advances up to the contiguous watermark.
+  A pool never resends on its own: lowering the limit on timeout is load control.
+- Participant 429 = not processed, resending is safe.
+  Timeout = I don't know, the only safe operation is to query the status. Never confuse the two.
 
-## Comandos
+## Commands
 make test        # go test -race ./...
 make lint
 make up          # docker compose up -d
 make migrate-up
-make replay      # reconstrói a projeção do zero
+make replay      # rebuilds the projection from scratch
 
-## Estado atual
-Sessão N — <o que está pronto>
+## Current state
+Session N — <what is done>
 ```
 
-Atualize a linha de estado ao fim de cada sessão.
+Update the state line at the end of each session.
 
 ---
 
-## 2. Convenções
+## 2. Conventions
 
-**Branches.** Trabalho solo: commits direto na `main`, sem PR. O CI roda no `push`.
+**Branches.** Solo work: commits straight to `main`, no PRs. CI runs on `push`.
 
-**Commits.** Imperativo, uma mudança lógica por commit.
+**Commits.** Imperative, one logical change per commit.
 
-**Testes.** Table-driven como padrão. O nome do caso descreve o comportamento:
-`evento_com_versao_menor_e_descartado`.
+**Tests.** Table-driven by default. The case name describes the behavior:
+`evento_com_versao_menor_e_descartado` (the project's test names are in Portuguese;
+"an event with a lower version is discarded").
 
-**Eventos.** Nome no passado, sempre (`InstructionAccepted`, não `AcceptInstruction`).
-Comando é imperativo, evento é fato consumado. Confundir os dois é o erro de vocabulário
-mais comum em event sourcing e aparece em revisão.
+**Events.** Named in the past tense, always (`InstructionAccepted`, not `AcceptInstruction`).
+A command is imperative, an event is an accomplished fact. Mixing the two up is the most
+common vocabulary mistake in event sourcing and it shows up in review.
 
-**Nada de `pkg/`.**
+**No `pkg/`.**
 
 ---
 
-## 3. Fases
+## 3. Phases
 
-### Fase A — domínio e event store (sessões 1-4)
+### Phase A — domain and event store (sessions 1-4)
 
-| Sessão | Entrega |
+| Session | Deliverable |
 |---|---|
-| 1 | Repo, CI com lint + `-race`, `CLAUDE.md`, migration 001 com as quatro tabelas |
-| 2 | Os oito eventos, `Money`, a máquina de estados, reconstrução do agregado, transições ilegais com erro tipado |
-| 3 | Adapter Postgres: append com versão esperada, load do agregado, testcontainers |
-| 4 | Teste de concorrência otimista: N goroutines gravando a mesma versão, exatamente uma vence |
+| 1 | Repo, CI with lint + `-race`, `CLAUDE.md`, migration 001 with the four tables |
+| 2 | The eight events, `Money`, the state machine, aggregate rebuild, illegal transitions with a typed error |
+| 3 | Postgres adapter: append with expected version, aggregate load, testcontainers |
+| 4 | Optimistic concurrency test: N goroutines writing the same version, exactly one wins |
 
-**Pronto quando:** `go test ./internal/domain/...` cobre a máquina de estados inteira em
-menos de 1s sem Docker, e o teste da sessão 4 passa sob `-race` vinte vezes sem flake.
+**Done when:** `go test ./internal/domain/...` covers the whole state machine in under 1 s
+without Docker, and the session 4 test passes under `-race` twenty times with no flake.
 
-**Armadilha:** a tentação de dar ao agregado um método que grava. O domínio decide e
-produz eventos; quem grava é o adapter. Se o domínio importar pgx, a fase A falhou.
+**Trap:** the temptation to give the aggregate a method that writes. The domain decides and
+produces events; the adapter does the writing. If the domain imports pgx, phase A failed.
 
 ---
 
-### Fase B — comando e leitura (sessões 5-8)
+### Phase B — command and read (sessions 5-8)
 
-| Sessão | Entrega |
+| Session | Deliverable |
 |---|---|
-| 5 | Caso de uso "aceitar instrução" + idempotência escopada com fingerprint, na mesma transação |
-| 6 | HTTP: `POST /instructions` (202), `GET /instructions/{id}` autoritativo, DTOs, erro de domínio → status; `POST /auth/token` (client_id + segredo → JWT HS256 de 15 min), clientes na tabela `clients`, cadastro por `cmd/clientctl` |
-| 7 | Correlation ID, `log/slog`, timeouts explícitos, `context` propagado, `/healthz` e `/readyz` separados |
-| 8 | `docker compose up`, graceful shutdown completo, README v1 |
+| 5 | "Accept instruction" use case + scoped idempotency with a fingerprint, in the same transaction |
+| 6 | HTTP: `POST /instructions` (202), authoritative `GET /instructions/{id}`, DTOs, domain error → status; `POST /auth/token` (client_id + secret → 15-minute HS256 JWT), clients in the `clients` table, registration through `cmd/clientctl` |
+| 7 | Correlation ID, `log/slog`, explicit timeouts, propagated `context`, separate `/healthz` and `/readyz` |
+| 8 | `docker compose up`, full graceful shutdown, README v1 |
 
-**Pronto quando:** outra pessoa clona, sobe e cria uma instrução sem te perguntar nada.
+**Done when:** another person clones it, brings it up and creates an instruction without
+asking you anything.
 
-**Ponto apresentável 1.** Se um processo seletivo abrir aqui, você tem um serviço
-event-sourced funcionando e documentado.
+**Presentable milestone 1.** If a hiring process opens here, you have a working,
+documented event-sourced service.
 
 ---
 
-### Fase C — a fronteira assíncrona (sessões 9-12)
+### Phase C — the asynchronous boundary (sessions 9-12)
 
-| Sessão | Entrega |
+| Session | Deliverable |
 |---|---|
-| 9 | Outbox gravado na mesma transação do evento; invariante 2 no CI |
-| 10 | `cmd/relay` com `FOR UPDATE SKIP LOCKED` publicando no Kafka; teste matando o relay no meio |
-| 11 | `cmd/participant`: os seis comportamentos configuráveis, incluindo responder depois do timeout |
-| 12 | `cmd/processor` consumindo `InstructionAccepted`, roteando, e aplicando a resposta |
+| 9 | Outbox written in the same transaction as the event; invariant 2 in CI |
+| 10 | `cmd/relay` with `FOR UPDATE SKIP LOCKED` publishing to Kafka; test killing the relay midway |
+| 11 | `cmd/participant`: the six configurable behaviors, including answering after the timeout |
+| 12 | `cmd/processor` consuming `InstructionAccepted`, routing, and applying the response |
 
-**Pronto quando:** uma instrução criada via HTTP chega a `settled` ou `rejected` sem
-intervenção, passando por Kafka, e o teste de interrupção do relay prova que nada se
-perdeu.
+**Done when:** an instruction created over HTTP reaches `settled` or `rejected` without
+intervention, going through Kafka, and the relay interruption test proves nothing was
+lost.
 
-**Armadilha:** publicar no Kafka dentro do handler. Isso é *dual write* e é exatamente o
-que o outbox existe para evitar — o evento tem que estar na mesma transação SQL.
+**Trap:** publishing to Kafka inside the handler. That is a *dual write* and it is exactly
+what the outbox exists to avoid — the event has to be in the same SQL transaction.
 
 ---
 
-### Fase D — o estado desconhecido (sessões 13-20)
+### Phase D — the unknown state (sessions 13-20)
 
-O coração do projeto. Reserve fôlego: é a fase que mais vai render em entrevista e a que
-mais vai quebrar.
+The heart of the project. Save your energy: it is the phase that will pay off most in an
+interview and the one that will break most.
 
-| Sessão | Entrega |
+| Session | Deliverable |
 |---|---|
-| 13 | Timeout no envio → `RoutingTimedOut` → `unknown`, com a task de conciliação criada na mesma transação |
-| 14 | Loop de conciliação: varredura por `next_attempt_at`, consulta de status, backoff com jitter |
-| 15 | `ReconciliationExhausted` após N tentativas; **o teste do caso cruel**: participante responde depois do timeout e a conciliação descobre que a operação aconteceu |
-| 16 | Teste ponta a ponta dos seis comportamentos do participante |
-| 17 | Rate limit de saída: limitador antes do envio, `pause`/`resume` da partição, `RoutingThrottled` no `429`. Mais o token bucket de entrada portado do wallet-go |
-| 18 | `internal/elastic.WorkerPool`: min/max, crescimento por fila e espera, encolhimento com histerese, afinidade por `aggregate_id`, watermark contíguo de offset. Testes unitários sem Kafka, sob `-race` |
-| 19 | Conexões elásticas para o participante: limitador AIMD de requisições em voo + `http.Transport` acompanhando o limite; integração do pool no processor |
-| 20 | Folga e dívida acumulada |
+| 13 | Send timeout → `RoutingTimedOut` → `unknown`, with the reconciliation task created in the same transaction |
+| 14 | Reconciliation loop: sweep by `next_attempt_at`, status query, backoff with jitter |
+| 15 | `ReconciliationExhausted` after N attempts; **the cruel-case test**: the participant answers after the timeout and reconciliation discovers the operation happened |
+| 16 | End-to-end test of the six participant behaviors |
+| 17 | Output rate limit: limiter before the send, partition `pause`/`resume`, `RoutingThrottled` on `429`. Plus the input token bucket ported from wallet-go |
+| 18 | `internal/elastic.WorkerPool`: min/max, growth by queue and wait, shrinking with hysteresis, `aggregate_id` affinity, contiguous offset watermark. Unit tests without Kafka, under `-race` |
+| 19 | Elastic connections to the participant: AIMD in-flight request limiter + `http.Transport` following the limit; pool integration into the processor |
+| 20 | Slack and accumulated debt |
 
-**Pronto quando:** com o participante configurado para "processa mas não responde", a
-instrução passa por `unknown` e termina em `settled` sem nenhuma intervenção manual, e o
-teste prova que **nenhuma instrução foi enviada duas vezes** nesse caminho.
+**Done when:** with the participant configured as "processes but does not answer", the
+instruction goes through `unknown` and ends in `settled` with no manual intervention, and
+the test proves that **no instruction was sent twice** on that path.
 
-**Ponto apresentável 2.** Aqui a tese do projeto está provada. Tudo depois disso é
-qualidade de engenharia em cima de uma ideia que já funciona.
+**Presentable milestone 2.** Here the project's thesis is proven. Everything after this is
+engineering quality on top of an idea that already works.
 
-**Armadilha:** reenviar a instrução em vez de consultar o status. Sob `unknown`, reenviar
-pode cobrar duas vezes — consulta é a única operação segura. Essa distinção é o ADR 5 e é
-a melhor resposta curta que o projeto te dá.
+**Trap:** resending the instruction instead of querying the status. Under `unknown`,
+resending can charge twice — a query is the only safe operation. That distinction is ADR 5
+and it is the best short answer the project gives you.
 
 ---
 
-### Fase E — projeção (sessões 21-25)
+### Phase E — projection (sessions 21-25)
 
-| Sessão | Entrega |
+| Session | Deliverable |
 |---|---|
-| 21 | `cmd/projector`: consumidor Kafka, projeção Mongo, idempotência por `version` |
-| 22 | Testes de reentrega do mesmo evento e de evento fora de ordem |
-| 23 | Redis: cache de status com versão; `GET /instructions?status=...` pela projeção |
-| 24 | Replay completo: comando que descarta a projeção e reconstrói do event store |
-| 25 | Folga |
+| 21 | `cmd/projector`: Kafka consumer, Mongo projection, idempotency by `version` |
+| 22 | Tests for redelivery of the same event and for an out-of-order event |
+| 23 | Redis: status cache with version; `GET /instructions?status=...` through the projection |
+| 24 | Full replay: a command that discards the projection and rebuilds it from the event store |
+| 25 | Slack |
 
-**Pronto quando:** você apaga a coleção do Mongo, roda `make replay`, e a projeção volta
-idêntica — sem nenhuma mensagem reenviada ao participante. Esse teste é a prova do ADR 2.
+**Done when:** you delete the Mongo collection, run `make replay`, and the projection comes
+back identical — with no message resent to the participant. That test is the proof of ADR 2.
 
-**Armadilha:** o projector precisando de estado próprio além da versão. Se ele precisar
-consultar o Postgres para decidir o que fazer com um evento, a projeção deixou de ser
-função pura dos eventos.
+**Trap:** the projector needing state of its own beyond the version. If it needs to query
+Postgres to decide what to do with an event, the projection stopped being a pure function of
+the events.
 
 ---
 
-### Fase F — observabilidade e medição (sessões 26-29)
+### Phase F — observability and measurement (sessions 26-29)
 
-| Sessão | Entrega |
+| Session | Deliverable |
 |---|---|
-| 26 | OTel: trace atravessando api → relay → Kafka → processor/projector; métricas de lag, tentativas e fila de conciliação |
-| 27 | Harness de carga, instrumentação do lag, seed determinístico |
-| 28 | Experimento 7.1: lag da projeção com 1, 2 e 4 consumidores, dois níveis de carga |
-| 29 | Experimentos 7.2 (replay com 10k/100k/1M) e 7.4 (saturação do participante, pool fixo contra elástico). 7.3 só se sobrar tempo |
+| 26 | OTel: a trace crossing api → relay → Kafka → processor/projector; metrics for lag, attempts and the reconciliation queue |
+| 27 | Load harness, lag instrumentation, deterministic seed |
+| 28 | Experiment 7.1: projection lag with 1, 2 and 4 consumers, two load levels |
+| 29 | Experiments 7.2 (replay with 10k/100k/1M) and 7.4 (participant saturation, fixed pool against elastic). 7.3 only if time is left |
 
-**Pronto quando:** `docs/bench/` tem os dados brutos e qualquer pessoa repete a execução a
-partir do que está escrito.
+**Done when:** `docs/bench/` has the raw data and anyone can repeat the run from what is
+written.
 
-**Armadilha:** propagação de contexto através do Kafka não acontece de graça. O
-`traceparent` tem que viajar nos headers da mensagem e ser extraído do outro lado, senão
-você tem dois traces desconexos em vez de um. É a parte que mais frequentemente fica pela
-metade.
+**Trap:** context propagation through Kafka does not come for free. The `traceparent` has
+to travel in the message headers and be extracted on the other side, otherwise you get two
+disconnected traces instead of one. It is the part that most often ends up half done.
 
 ---
 
-### Fase G — falha induzida e documentação (sessões 30-33)
+### Phase G — induced failure and documentation (sessions 30-33)
 
-| Sessão | Entrega |
+| Session | Deliverable |
 |---|---|
-| 30 | Roteiros 1-4: Kafka cai e volta, Mongo cai, processor morre no meio do roteamento, `kill -9` entre o append e o publish |
-| 31 | Roteiros 5-6 e `docs/resilience-report.md` com as hipóteses escritas antes |
-| 32 | `docs/performance-report.md` + os 10 ADRs |
-| 33 | README final, limitações conhecidas, folga |
+| 30 | Scripts 1-4: Kafka goes down and comes back, Mongo goes down, the processor dies midway through routing, `kill -9` between the append and the publish |
+| 31 | Scripts 5-6 and `docs/resilience-report.md` with the hypotheses written beforehand |
+| 32 | `docs/performance-report.md` + the 10 ADRs |
+| 33 | Final README, known limitations, slack |
 
-**O protocolo, igual ao do projeto anterior:** cada falha vira uma hipótese escrita
-**antes**, o comportamento observado depois, e a divergência preservada no texto.
-Hipótese errada não é corrigida retroativamente — é ela que prova que o teste foi real.
+**The protocol, same as the previous project:** every failure becomes a hypothesis written
+**beforehand**, the behavior observed afterwards, and the divergence preserved in the text.
+A wrong hypothesis is not corrected retroactively — it is what proves the test was real.
 
-O roteiro mais valioso é `kill -9` entre o append do evento e a publicação: é o cenário
-que o outbox existe para cobrir, e é onde você demonstra que a reentrega funciona.
+The most valuable script is `kill -9` between the event append and the publish: it is the
+scenario the outbox exists to cover, and it is where you demonstrate that redelivery works.
 
 ---
 
-## 4. Riscos e contingência
+## 4. Risks and contingency
 
-| Risco | Sinal | Resposta |
+| Risk | Signal | Response |
 |---|---|---|
-| **Máquina não aguenta a stack** (Postgres + Kafka + Mongo + Redis + 5 processos) | Swap, lentidão, número instável | Use **Redpanda** no lugar do Kafka para desenvolvimento e teste: compatível com o protocolo, sobe em ~1s contra ~20s, consome uma fração da memória. Mantenha Kafka real só na execução de medição |
-| Testcontainers com Kafka deixa a suíte lenta | Suíte acima de 3min | Container compartilhado por pacote, com tópico novo por teste; ou Redpanda |
-| Fase D estoura | Sessão 16 não fecha na semana 11 | Corte o `ReconciliationExhausted` com escalonamento e deixe só o limite de tentativas |
-| Pool elástico reordena ou perde mensagem ao redimensionar | Teste de propriedade falha: mesmo agregado fora de ordem, ou offset commitado à frente de mensagem em voo | Fixe o pool em tamanho constante, prove ordem e watermark, e só então ligue a elasticidade. Se não fechar, o experimento 7.4 compara apenas pools fixos e o limite fica declarado |
-| `pause`/`resume` de partição dá nó | Consumidor para e não volta, ou duplica | Comece limitando com token bucket antes do envio e só depois pause a partição. O limitador sozinho já evita estourar o participante; o pause é o que evita acumular na memória |
-| Medição ruidosa | Variação acima de 15% entre repetições | Mude o ambiente antes de aumentar repetições. A lição do wallet-go: gerador competindo com os serviços produz curva não-monotônica |
-| Processo seletivo abre antes da fase F | — | Pare na sessão 17, declare o estado no README, apresente assim. A tese já está provada |
-| Escopo inflando | Você está escrevendo saga, ou um segundo agregado | Releia a régua: isso só existe porque a fronteira é assíncrona? Saga não entra |
+| **The machine cannot handle the stack** (Postgres + Kafka + Mongo + Redis + 5 processes) | Swap, slowness, unstable numbers | Use **Redpanda** in place of Kafka for development and testing: protocol-compatible, starts in ~1 s against ~20 s, uses a fraction of the memory. Keep real Kafka only for the measurement runs |
+| Testcontainers with Kafka makes the suite slow | Suite above 3 min | Container shared per package, with a new topic per test; or Redpanda |
+| Phase D overruns | Session 16 does not close by week 11 | Cut `ReconciliationExhausted` with escalation and keep only the attempt limit |
+| The elastic pool reorders or loses a message when resizing | Property test fails: same aggregate out of order, or an offset committed ahead of an in-flight message | Pin the pool at a constant size, prove ordering and watermark, and only then turn elasticity on. If it does not close, experiment 7.4 compares only fixed pools and the limit is declared |
+| Partition `pause`/`resume` gets tangled | The consumer stops and does not come back, or duplicates | Start by limiting with a token bucket before the send and only then pause the partition. The limiter alone already avoids overrunning the participant; the pause is what avoids piling up in memory |
+| Noisy measurement | Variation above 15% between repetitions | Change the environment before adding repetitions. The wallet-go lesson: a generator competing with the services produces a non-monotonic curve |
+| A hiring process opens before phase F | — | Stop at session 17, declare the state in the README, present it that way. The thesis is already proven |
+| Scope inflating | You are writing a saga, or a second aggregate | Reread the yardstick: does this only exist because the boundary is asynchronous? A saga does not get in |
 
 ---
 
-## 5. As onze perguntas de defesa
+## 5. The eleven defense questions
 
-Uma por semana, respondida em voz alta, cronometrada em dois minutos, com referência ao
-seu código. É a atividade que converte o projeto em aprovação.
+One per week, answered out loud, timed at two minutes, with reference to your code. It is
+the activity that turns the project into an offer.
 
-1. O envio deu timeout. O que o sistema faz, e por que não pode simplesmente reenviar?
-2. O mesmo evento chega duas vezes no projector. O que acontece?
-3. Dois eventos do mesmo agregado chegam fora de ordem. E agora?
-4. Dois comandos concorrentes no mesmo agregado. Quem ganha, e como você sabe?
-5. Por que o envio ao participante não pode morar no consumidor de eventos?
-6. O cliente cria uma instrução e consulta em seguida. Ele vê?
-7. Você apagou a projeção por engano. Qual é o procedimento, e quanto tempo leva?
-8. Por que particionar por `aggregate_id` e não garantir ordem global?
-9. O participante devolveu `429` e, em outra instrução, deu timeout. Por que você trata as duas de formas opostas?
-10. A entrada chega a quatro vezes o que o participante aceita. O que o sistema faz, e o que ele não faz?
+1. The send timed out. What does the system do, and why can't it simply resend?
+2. The same event reaches the projector twice. What happens?
+3. Two events of the same aggregate arrive out of order. Now what?
+4. Two concurrent commands on the same aggregate. Who wins, and how do you know?
+5. Why can't the send to the participant live in the event consumer?
+6. The client creates an instruction and reads it right after. Do they see it?
+7. You deleted the projection by mistake. What is the procedure, and how long does it take?
+8. Why partition by `aggregate_id` instead of guaranteeing global ordering?
+9. The participant returned `429` and, on another instruction, timed out. Why do you treat the two in opposite ways?
+10. Input arrives at four times what the participant accepts. What does the system do, and what does it not do?
 
-11. O worker pool cresce de 2 para 20 goroutines no meio da carga. Como você garante que dois eventos do mesmo agregado não rodam juntos nem fora de ordem, e que nenhum offset é commitado antes da hora?
+11. The worker pool grows from 2 to 20 goroutines in the middle of the load. How do you guarantee that two events of the same aggregate do not run together or out of order, and that no offset is committed before its time?
 
-A pergunta 1 é a que o projeto existe para responder. A 7 é a que você vai responder com
-um número medido, o que quase nenhum candidato consegue.
+Question 1 is the one the project exists to answer. Question 7 is the one you will answer
+with a measured number, which almost no candidate can do.
 
 ---
 
-## 6. Checklist final
+## 6. Final checklist
 
-- [ ] `go test -race ./...` verde no CI
-- [ ] As duas invariantes do event store testadas automaticamente
-- [ ] Teste de concorrência otimista sem flake em 20 execuções
-- [ ] Teste de reentrega e de evento fora de ordem no projector
-- [ ] O caso cruel coberto: participante processa, não responde, conciliação descobre
-- [ ] `make replay` reconstrói a projeção sem reenviar nada ao participante
-- [ ] Trace único atravessando os cinco processos
-- [ ] `docker compose up` funciona em máquina limpa
-- [ ] Sob entrada acima do limite de saída, nada se perde e o consumidor recupera
-- [ ] Relatórios de medição com metodologia e ameaças à validade
-- [ ] 10 ADRs escritos
-- [ ] Relatório de resiliência com pelo menos uma hipótese errada preservada
-- [ ] README com limitações conhecidas
-- [ ] Teste de propriedade do pool elástico: ordem por agregado e watermark preservados sob redimensionamento, `-race`, 20 execuções
-- [ ] Você responde as onze perguntas em voz alta, sem olhar, em dois minutos cada
+- [ ] `go test -race ./...` green in CI
+- [ ] Both event store invariants tested automatically
+- [ ] Optimistic concurrency test with no flake in 20 runs
+- [ ] Redelivery and out-of-order event tests in the projector
+- [ ] The cruel case covered: the participant processes, does not answer, reconciliation discovers it
+- [ ] `make replay` rebuilds the projection without resending anything to the participant
+- [ ] A single trace crossing the five processes
+- [ ] `docker compose up` works on a clean machine
+- [ ] Under input above the output limit, nothing is lost and the consumer recovers
+- [ ] Measurement reports with methodology and threats to validity
+- [ ] 10 ADRs written
+- [ ] Resilience report with at least one wrong hypothesis preserved
+- [ ] README with known limitations
+- [ ] Elastic pool property test: per-aggregate order and watermark preserved under resizing, `-race`, 20 runs
+- [ ] You answer the eleven questions out loud, without looking, in two minutes each
 
-O último item é o único sem código associado e é o que decide a entrevista.
+The last item is the only one with no code attached, and it is the one that decides the
+interview.
