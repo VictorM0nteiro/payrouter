@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-// beahvior é como o participante reage a uma instrução
+// Behavior é como o participante reage a uma instrução.
 type Behavior string
 
 const (
@@ -36,7 +36,7 @@ const (
 // All lista os comportamentos conhecidos, na ordem em que a documentação os apresenta.
 var All = []Behavior{Accept, Reject, Slow, Drop, Late, Crash}
 
-// Parse reconhece o nome de um comportamento, sem diferenciar maiusculas de minusculas
+// Parse reconhece o nome de um comportamento, sem diferenciar maiúsculas de minúsculas.
 func Parse(s string) (Behavior, error) {
 	name := Behavior(strings.ToLower(strings.TrimSpace(s)))
 	for _, b := range All {

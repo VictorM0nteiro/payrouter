@@ -32,14 +32,15 @@ Postgres with optimistic concurrency, accepting an instruction with scoped idemp
 API with temporary-token authentication, correlation ID, structured logs, explicit deadlines,
 health probes and graceful shutdown.
 
-Phase C is in progress (sessions 9 and 10): every event is stored together with an outbox
+Phase C is in progress (sessions 9 to 11): every event is stored together with an outbox
 row, in the same transaction, and the relay publishes the outbox to Kafka (Redpanda) with the
 key equal to the `aggregate_id`. Delivery is at-least-once: if the relay dies between
 publishing and marking, the message goes out again, and whoever consumes it is idempotent by
 version.
 
-There is still no consumer, projection or simulated participant: the instruction is accepted,
-goes to the topic and stays in `accepted`. The full plan is in
+The simulated participant (the external counterparty) also exists now, but nothing routes to
+it yet. There is still no consumer or projection: the instruction is accepted, goes to the
+topic and stays in `accepted`. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Up and running in five minutes
@@ -75,9 +76,34 @@ To see the instruction reach Kafka:
 docker compose exec redpanda rpk topic consume payrouter.instructions.events -n 5
 ```
 
-For another client: `make demo-client ID=store-a`. To follow the logs: `make logs` (API)
-and `make logs-relay` (relay).
+For another client: `make demo-client ID=store-a`. To follow the logs: `make logs` (API),
+`make logs-relay` (relay) and `make logs-participant` (participant).
 To stop: `make down` (add `-v` to `docker compose down` to delete the database).
+
+## The simulated participant
+
+`participant` (port 9090) is the external counterparty. It is part of the system, not a mock:
+it keeps what it processed, never processes the same `instruction_id` twice, and counts how
+many times each instruction arrived (`received`).
+
+| Behavior | Processes? | Answer |
+|---|---|---|
+| `accept` | yes | `accepted` at once |
+| `reject` | yes | `rejected` with `REJECT_CODE` (default `insufficient_funds`) |
+| `slow` | yes | `accepted` after `SLOW_DELAY` (1 s), inside the client's deadline |
+| `drop` | no | never answers; the status query finds nothing |
+| `late` | yes, at once | `accepted` only after `LATE_DELAY` (10 s), when the client already gave up: the cruel case |
+| `crash` | no | the process exits; compose restarts it |
+
+`PARTICIPANT_BEHAVIOR` sets the default (`accept`). A prefix in `end_to_end_id` forces the
+behavior of one instruction, for example `late:order-1`. The status query is
+`GET /payments/{instruction_id}`:
+
+```bash
+curl -s -m 2 localhost:9090/payments -d '{"instruction_id":"x1","amount_cents":100,"debtor":"a","creditor":"b","end_to_end_id":"late:1"}'
+# the client times out, but the operation happened:
+curl -s localhost:9090/payments/x1   # {"status":"accepted","received":1}
+```
 
 ## Development
 
@@ -143,8 +169,10 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 
 ## Known limitations (v1)
 
-- The instruction stays in `accepted`: the relay publishes it to Kafka, but there is still no
-  processor or participant (sessions 11 and 12).
+- The instruction stays in `accepted`: the relay publishes it to Kafka and the participant
+  exists, but there is no processor to route between them yet (session 12).
+- The participant keeps its state in memory: a `crash` or restart forgets everything it
+  processed.
 - At-least-once delivery: the same event can appear twice in the topic after the relay
   dies. There is no consumer yet; when there is one, it will discard what it has already seen by version.
 - Published outbox rows are not deleted: there is no cleanup routine yet.

@@ -1,6 +1,6 @@
 # docker-compose.yml
-# Infraestrutura local do payrouter: PostgreSQL 16, as migrations, Redpanda (Kafka), a API e o
-# relay do outbox. Mongo e Redis entram nas fases seguintes.
+# Infraestrutura local do payrouter: PostgreSQL 16, as migrations, Redpanda (Kafka), a API,
+# o relay do outbox e o participante simulado. Mongo e Redis entram nas fases seguintes.
 # Objetivo: `make env && make up` bastam para ter o sistema inteiro no ar, sem instalar nada.
 # A ordem é garantida pelo compose: o Postgres fica saudável, as migrations rodam até o fim e
 # só então a API sobe; o relay espera também o tópico existir.
@@ -104,6 +104,25 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-json}
     # O relay termina a rodada em andamento ao receber SIGTERM; a rodada é curta.
     stop_grace_period: 15s
+
+  # Participante simulado (a contraparte externa). PARTICIPANT_BEHAVIOR define o padrão
+  # (accept, reject, slow, drop, late, crash); um prefixo no end_to_end_id ("late:abc") força o
+  # comportamento de uma instrução. O restart devolve o serviço depois de um `crash`.
+  participant:
+    build: .
+    entrypoint: ["participant"]
+    environment:
+      PARTICIPANT_BEHAVIOR: ${PARTICIPANT_BEHAVIOR:-accept}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
 
 volumes:
   pgdata:

@@ -3,7 +3,7 @@
 # Objetivo: ter um vocabulário único (test, lint, up, migrate-up...) igual ao do CLAUDE.md
 # e ao do CI. Rodar via Git Bash ou WSL (make não vem no Windows puro).
 
-.PHONY: test test-flake lint env up db down logs logs-relay demo-client migrate-up migrate-down replay
+.PHONY: test test-flake lint env up db down logs logs-relay demo-client migrate-up migrate-down replay logs-participant
 
 test:
 	go test -race ./...
@@ -35,6 +35,9 @@ logs:
 
 logs-relay:
 	docker compose logs -f relay
+
+logs-participant:
+	docker compose logs -f participant
 
 # Cadastra um cliente e imprime o segredo uma única vez: make demo-client ID=loja-a
 ID ?= demo
