@@ -1,4 +1,4 @@
-// process_instruction.go
+// process.go
 // Caso de uso do processor: reage a um InstructionAccepted, despacha a instrução ao
 // participante e aplica a resposta como ParticipantAccepted ou ParticipantRejected.
 // Objetivo: ser o lugar do efeito colateral no lado do comando. A idempotência é pela versão
@@ -15,8 +15,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
+)
+
+const (
+	// applyAttempts e applyPause limitam a repetição da gravação da resposta já recebida.
+	applyAttempts = 3
+	applyPause    = 200 * time.Millisecond
 )
 
 // ErrOutcomeUnknown: não se sabe se o participante processou a instrução (timeout, conexão
@@ -35,10 +42,10 @@ const (
 // PaymentRequest é o que se envia ao participante. O valor é sempre int64 de centavos.
 type PaymentRequest struct {
 	InstructionID string
-	AmountCents int64
-	Debtor      string
-	Creditor    string
-	EndToEndID  string
+	AmountCents   int64
+	Debtor        string
+	Creditor      string
+	EndToEndID    string
 }
 
 // PaymentResult é a resposta conclusiva do participante. Code só vale em PaymentRejected.
@@ -160,15 +167,26 @@ func (uc *ProcessInstruction) apply(ctx context.Context, p *domain.PaymentInstru
 		return fmt.Errorf("instrução %s: %w", p.ID(), err)
 	}
 
-	err = uc.uow.Do(ctx, func(ctx context.Context, tx Tx) error {
-		return tx.Events().Append(ctx, p.ID(), expected, event)
-	})
-	if errors.Is(err, ErrConcurrencyConflict) {
-		// Outro processo já resolveu a instrução (a conciliação, por exemplo).
-		slog.InfoContext(ctx, "processor: instrução já resolvida por outro caminho", "instruction_id", string(p.ID()))
-		return nil
+	// Repete só a gravação: reentregar a mensagem não ajudaria, pois a instrução já está em
+	// in_flight e ela seria pulada como repetida, perdendo a resposta que já temos.
+	for attempt := range applyAttempts {
+		if attempt > 0 {
+			time.Sleep(applyPause)
+		}
+		err = uc.uow.Do(ctx, func(ctx context.Context, tx Tx) error {
+			return tx.Events().Append(ctx, p.ID(), expected, event)
+		})
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, ErrConcurrencyConflict) {
+			// Outro processo já resolveu a instrução (a conciliação, por exemplo).
+			slog.InfoContext(ctx, "processor: instrução já resolvida por outro caminho", "instruction_id", string(p.ID()))
+			return nil
+		}
 	}
-	return err
+	// A instrução fica em in_flight; a conciliação consulta o participante e descobre o resultado.
+	return fmt.Errorf("instrução %s: resposta do participante não gravada: %w: %w", p.ID(), ErrOutcomeUnknown, err)
 }
 
 // asUnknown garante que um erro do envio carregue ErrOutcomeUnknown: depois do Pay, não

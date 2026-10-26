@@ -1,6 +1,6 @@
 # docker-compose.yml
 # Infraestrutura local do payrouter: PostgreSQL 16, as migrations, Redpanda (Kafka), a API,
-# o relay do outbox e o participante simulado. Mongo e Redis entram nas fases seguintes.
+# o relay do outbox, o processor e o participante simulado. Mongo e Redis entram nas fases seguintes.
 # Objetivo: `make env && make up` bastam para ter o sistema inteiro no ar, sem instalar nada.
 # A ordem é garantida pelo compose: o Postgres fica saudável, as migrations rodam até o fim e
 # só então a API sobe; o relay espera também o tópico existir.
@@ -103,6 +103,29 @@ services:
       KAFKA_BROKERS: redpanda:9092
       LOG_FORMAT: ${LOG_FORMAT:-json}
     # O relay termina a rodada em andamento ao receber SIGTERM; a rodada é curta.
+    stop_grace_period: 15s
+
+  # Consome InstructionAccepted do Kafka, envia ao participante e grava a resposta. Idempotente
+  # pela versão do agregado: mais de uma instância não envia a mesma instrução duas vezes. Um
+  # envio sem resposta (timeout) deixa a instrução em in_flight; nunca é reenviado.
+  processor:
+    build: .
+    entrypoint: ["processor"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+      participant:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://payrouter:payrouter@postgres:5432/payrouter?sslmode=disable
+      KAFKA_BROKERS: redpanda:9092
+      PARTICIPANT_URL: http://participant:9090
+      PARTICIPANT_TIMEOUT: ${PARTICIPANT_TIMEOUT:-3s}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    restart: unless-stopped
+    # Termina a mensagem em andamento ao receber SIGTERM; o envio tem prazo próprio.
     stop_grace_period: 15s
 
   # Participante simulado (a contraparte externa). PARTICIPANT_BEHAVIOR define o padrão

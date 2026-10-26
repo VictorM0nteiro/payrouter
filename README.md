@@ -32,15 +32,16 @@ Postgres with optimistic concurrency, accepting an instruction with scoped idemp
 API with temporary-token authentication, correlation ID, structured logs, explicit deadlines,
 health probes and graceful shutdown.
 
-Phase C is in progress (sessions 9 to 11): every event is stored together with an outbox
+Phase C is complete (sessions 9 to 12): every event is stored together with an outbox
 row, in the same transaction, and the relay publishes the outbox to Kafka (Redpanda) with the
 key equal to the `aggregate_id`. Delivery is at-least-once: if the relay dies between
 publishing and marking, the message goes out again, and whoever consumes it is idempotent by
 version.
 
-The simulated participant (the external counterparty) also exists now, but nothing routes to
-it yet. There is still no consumer or projection: the instruction is accepted, goes to the
-topic and stays in `accepted`. The full plan is in
+The simulated participant (the external counterparty) exists, and the processor routes each
+accepted instruction to it: without any intervention it reaches `settled` or `rejected`,
+going through Kafka. If the send gets no conclusive answer it stays `in_flight` and is never
+resent; reconciling it is Phase D. There is still no projection. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Up and running in five minutes
@@ -48,7 +49,7 @@ topic and stays in `accepted`. The full plan is in
 Requirements: Docker (with Compose) and `make`. On Windows, use Git Bash or WSL.
 
 ```bash
-make up            # creates .env with a random JWT_SECRET and brings up Postgres, migrations, Redpanda, API and relay
+make up            # creates .env with a random JWT_SECRET and brings up Postgres, migrations, Redpanda, API, relay, participant and processor
 make demo-client   # registers the "demo" client and prints the client_secret (exactly once)
 ```
 
@@ -66,8 +67,12 @@ curl -si localhost:8080/instructions \
 
 # 3. repeating step 2 returns the same instruction, with the header Idempotent-Replayed: true
 
-# 4. read it back (state rebuilt from the event store, with no lag)
+# 4. read it back (state rebuilt from the event store, with no lag): after a moment
+#    the processor has routed it and the status is "settled"
 curl -s localhost:8080/instructions/<id> -H "Authorization: Bearer <access_token>"
+
+# 5. force a behavior with a prefix in end_to_end_id: "reject:1" ends in "rejected";
+#    "late:1" stays "in_flight" (the participant processed it, the answer came too late)
 ```
 
 To see the instruction reach Kafka:
@@ -77,7 +82,8 @@ docker compose exec redpanda rpk topic consume payrouter.instructions.events -n 
 ```
 
 For another client: `make demo-client ID=store-a`. To follow the logs: `make logs` (API),
-`make logs-relay` (relay) and `make logs-participant` (participant).
+`make logs-relay` (relay), `make logs-processor` (processor) and `make logs-participant`
+(participant).
 To stop: `make down` (add `-v` to `docker compose down` to delete the database).
 
 ## The simulated participant
@@ -104,6 +110,29 @@ curl -s -m 2 localhost:9090/payments -d '{"instruction_id":"x1","amount_cents":1
 # the client times out, but the operation happened:
 curl -s localhost:9090/payments/x1   # {"status":"accepted","received":1}
 ```
+
+## The processor
+
+`processor` consumes `InstructionAccepted` from Kafka, sends the instruction to the participant
+and records the answer. It is where the side effect lives (command side, never the projection).
+
+- **Idempotent by the aggregate version, with no deduplication table.** It reloads the
+  aggregate and acts only if the status is `accepted` at the message's version. Before sending
+  it appends `RoutingAttempted` with the expected version: that append is the claim, so a
+  repeated message, or two processors on the same message, send at most once.
+- **The send is outside any transaction**, and the answer is a second append (3 attempts).
+- **No conclusive answer is never resent.** A timeout, network error or `5xx` is an unknown
+  outcome: the offset advances and the instruction stays `in_flight`. Resending could charge
+  twice; the only safe operation is to query the status (Phase D).
+- **A transient error (database down) repeats the same message in place**, so order per
+  partition holds and lag grows instead of anything being dropped.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DATABASE_URL`, `KAFKA_BROKERS` | (required) | Postgres and Kafka |
+| `PARTICIPANT_URL` | (required) | e.g. `http://participant:9090` |
+| `PARTICIPANT_TIMEOUT` | `3s` | deadline of each send; `late` (10 s) does not fit, `slow` (1 s) does |
+| `KAFKA_GROUP` | `payrouter-processor` | consumer group |
 
 ## Development
 
@@ -169,12 +198,15 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 
 ## Known limitations (v1)
 
-- The instruction stays in `accepted`: the relay publishes it to Kafka and the participant
-  exists, but there is no processor to route between them yet (session 12).
+- A send with no conclusive answer leaves the instruction in `in_flight` forever: there is no
+  `RoutingTimedOut`, no `unknown` state and no reconciliation yet (sessions 13 to 15). The same
+  happens if the processor dies between claiming and sending.
+- There is no dead-letter queue: a message without the expected headers is logged and skipped.
+- The processor handles one message at a time (no worker pool yet).
 - The participant keeps its state in memory: a `crash` or restart forgets everything it
   processed.
 - At-least-once delivery: the same event can appear twice in the topic after the relay
-  dies. There is no consumer yet; when there is one, it will discard what it has already seen by version.
+  dies. The processor discards what it has already seen by version.
 - Published outbox rows are not deleted: there is no cleanup routine yet.
 - Token without refresh and without revocation before it expires; no rate limit on `/auth/token`.
 - No TLS: meant to run behind a proxy or only on a local network.

@@ -3,7 +3,7 @@
 # Objetivo: ter um vocabulário único (test, lint, up, migrate-up...) igual ao do CLAUDE.md
 # e ao do CI. Rodar via Git Bash ou WSL (make não vem no Windows puro).
 
-.PHONY: test test-flake lint env up db down logs logs-relay demo-client migrate-up migrate-down replay logs-participant
+.PHONY: test test-flake lint env up db down logs logs-relay demo-client migrate-up migrate-down replay logs-participant logs-processor
 
 test:
 	go test -race ./...
@@ -19,7 +19,7 @@ lint:
 env:
 	@test -f .env || { printf 'JWT_SECRET=%s\n' "$$(openssl rand -hex 32)" > .env && echo ".env criado"; }
 
-# Sobe tudo (Postgres, migrations, Redpanda, API, relay) e espera a API ficar pronta (/readyz).
+# Sobe tudo (Postgres, migrations, Redpanda, API, relay, processor, participante) e espera a API ficar pronta (/readyz).
 up: env
 	docker compose up -d --build --wait
 
@@ -38,6 +38,9 @@ logs-relay:
 
 logs-participant:
 	docker compose logs -f participant
+
+logs-processor:
+	docker compose logs -f processor
 
 # Cadastra um cliente e imprime o segredo uma única vez: make demo-client ID=loja-a
 ID ?= demo
