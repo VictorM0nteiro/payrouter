@@ -2,8 +2,9 @@
 // Testes de integração do processor contra um Postgres e um Redpanda reais (testcontainers).
 // Objetivo: provar a sessão 12. O caso de uso envia no máximo uma vez por instrução, mesmo com
 // a mensagem repetida ou com vários processors disputando a mesma; um envio sem resposta deixa
-// a instrução em in_flight e nunca é reenviado; e, de ponta a ponta (outbox, relay, Kafka,
-// processor, participante), uma instrução aceita chega a settled ou rejected sozinha.
+// a instrução em unknown, com a tarefa de conciliação gravada na mesma transação, e nunca é
+// reenviado; e, de ponta a ponta (outbox, relay, Kafka, processor, participante), uma instrução
+// aceita chega a settled, rejected ou unknown sozinha.
 
 package main
 
@@ -110,8 +111,23 @@ func acceptedMsg(id domain.InstructionID) app.Message {
 	return app.Message{AggregateID: string(id), EventType: "InstructionAccepted", Version: 1}
 }
 
+// testFirstDelay deixa a primeira consulta de conciliação no futuro.
+const testFirstDelay = time.Minute
+
 func newUseCase(p app.Participant) *app.ProcessInstruction {
-	return app.NewProcessInstruction(postgres.NewUnitOfWork(testPool), p)
+	return app.NewProcessInstruction(postgres.NewUnitOfWork(testPool), p, testFirstDelay)
+}
+
+// tasks devolve as tarefas de conciliação da instrução: quantas e a tentativa/horário da primeira.
+func tasks(t *testing.T, id domain.InstructionID) (n, attempts int, next time.Time) {
+	t.Helper()
+	err := testPool.QueryRow(context.Background(),
+		`SELECT count(*), COALESCE(max(attempts), 0), COALESCE(max(next_attempt_at), now()) FROM reconciliation_tasks WHERE aggregate_id = $1::uuid`,
+		string(id)).Scan(&n, &attempts, &next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n, attempts, next
 }
 
 func TestAceitaViraSettled(t *testing.T) {
@@ -195,38 +211,49 @@ func TestDoisProcessorsNaMesmaMensagemEnviamUmaVezSo(t *testing.T) {
 	}
 }
 
-func TestEnvioSemRespostaDeixaEmInFlightENuncaReenvia(t *testing.T) {
+func TestEnvioSemRespostaViraUnknownComTarefaENuncaReenvia(t *testing.T) {
 	requireInfra(t)
 	id := newAccepted(t, "e2e-5")
 	fake := &fakeParticipant{err: fmt.Errorf("%w: timeout", app.ErrOutcomeUnknown)}
 	uc := newUseCase(fake)
+	before := time.Now()
 
-	err := uc.Handle(context.Background(), acceptedMsg(id))
-	if !errors.Is(err, app.ErrOutcomeUnknown) {
-		t.Fatalf("erro = %v, esperado ErrOutcomeUnknown", err)
+	// O desconhecido foi gravado: a mensagem está tratada e o consumer pode avançar.
+	if err := uc.Handle(context.Background(), acceptedMsg(id)); err != nil {
+		t.Fatalf("Handle: %v", err)
 	}
 	// A mensagem é entregue de novo (at-least-once): não pode haver segundo envio.
 	if err := uc.Handle(context.Background(), acceptedMsg(id)); err != nil {
 		t.Fatalf("segunda entrega: %v", err)
 	}
 
-	if p := load(t, id); p.Status() != domain.StatusInFlight {
-		t.Errorf("status = %s, esperado in_flight", p.Status())
+	if p := load(t, id); p.Status() != domain.StatusUnknown || p.Version() != 3 {
+		t.Errorf("status=%s versão=%d; esperado unknown, 3", p.Status(), p.Version())
 	}
 	if fake.calls.Load() != 1 {
 		t.Errorf("envios = %d, esperado 1", fake.calls.Load())
 	}
+	n, attempts, next := tasks(t, id)
+	if n != 1 || attempts != 0 || next.Before(before.Add(testFirstDelay-time.Second)) {
+		t.Errorf("tarefas=%d tentativas=%d próxima=%v; esperado 1, 0 e ~agora+%v", n, attempts, next, testFirstDelay)
+	}
 }
 
-func TestErroDoParticipanteSemTipoTambemViraResultadoDesconhecido(t *testing.T) {
+func TestErroDoParticipanteSemTipoTambemViraUnknown(t *testing.T) {
 	requireInfra(t)
 	id := newAccepted(t, "e2e-6")
 	fake := &fakeParticipant{err: errors.New("conexão resetada")}
 
-	err := newUseCase(fake).Handle(context.Background(), acceptedMsg(id))
+	if err := newUseCase(fake).Handle(context.Background(), acceptedMsg(id)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
 
-	if !errors.Is(err, app.ErrOutcomeUnknown) {
-		t.Errorf("erro = %v, esperado ErrOutcomeUnknown: depois do envio, qualquer falha é desconhecida", err)
+	// Depois do envio, qualquer falha é desconhecida: a requisição pode ter chegado.
+	if p := load(t, id); p.Status() != domain.StatusUnknown {
+		t.Errorf("status = %s, esperado unknown", p.Status())
+	}
+	if n, _, _ := tasks(t, id); n != 1 {
+		t.Errorf("tarefas = %d, esperado 1", n)
 	}
 }
 
@@ -249,7 +276,7 @@ func TestFalhaTransitoriaAoGravarARespostaNaoPerdeOResultado(t *testing.T) {
 	requireInfra(t)
 	id := newAccepted(t, "e2e-8")
 	fake := &fakeParticipant{result: app.PaymentResult{Status: app.PaymentAccepted}}
-	uc := app.NewProcessInstruction(&flakyUoW{inner: postgres.NewUnitOfWork(testPool), failFrom: 2, failTo: 2}, fake)
+	uc := app.NewProcessInstruction(&flakyUoW{inner: postgres.NewUnitOfWork(testPool), failFrom: 2, failTo: 2}, fake, testFirstDelay)
 
 	if err := uc.Handle(context.Background(), acceptedMsg(id)); err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -264,7 +291,7 @@ func TestGravacaoDaRespostaQueNuncaFuncionaViraResultadoDesconhecido(t *testing.
 	requireInfra(t)
 	id := newAccepted(t, "e2e-9")
 	fake := &fakeParticipant{result: app.PaymentResult{Status: app.PaymentAccepted}}
-	uc := app.NewProcessInstruction(&flakyUoW{inner: postgres.NewUnitOfWork(testPool), failFrom: 2, failTo: 99}, fake)
+	uc := app.NewProcessInstruction(&flakyUoW{inner: postgres.NewUnitOfWork(testPool), failFrom: 2, failTo: 99}, fake, testFirstDelay)
 
 	err := uc.Handle(context.Background(), acceptedMsg(id))
 
@@ -274,6 +301,65 @@ func TestGravacaoDaRespostaQueNuncaFuncionaViraResultadoDesconhecido(t *testing.
 	}
 	if p := load(t, id); p.Status() != domain.StatusInFlight || fake.calls.Load() != 1 {
 		t.Errorf("status=%s envios=%d; esperado in_flight e 1", p.Status(), fake.calls.Load())
+	}
+}
+
+func TestFalhaTransitoriaAoGravarOUnknownNaoPerdeOResultado(t *testing.T) {
+	requireInfra(t)
+	id := newAccepted(t, "e2e-10")
+	fake := &fakeParticipant{err: fmt.Errorf("%w: timeout", app.ErrOutcomeUnknown)}
+	uc := app.NewProcessInstruction(&flakyUoW{inner: postgres.NewUnitOfWork(testPool), failFrom: 2, failTo: 2}, fake, testFirstDelay)
+
+	if err := uc.Handle(context.Background(), acceptedMsg(id)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if p := load(t, id); p.Status() != domain.StatusUnknown || fake.calls.Load() != 1 {
+		t.Errorf("status=%s envios=%d; esperado unknown e 1", p.Status(), fake.calls.Load())
+	}
+	if n, _, _ := tasks(t, id); n != 1 {
+		t.Errorf("tarefas = %d, esperado 1", n)
+	}
+}
+
+// brokenScheduleUoW faz a criação da tarefa falhar, para provar que o evento anda junto com ela.
+type brokenScheduleUoW struct{ inner app.UnitOfWork }
+
+func (b brokenScheduleUoW) Do(ctx context.Context, fn func(ctx context.Context, tx app.Tx) error) error {
+	return b.inner.Do(ctx, func(ctx context.Context, tx app.Tx) error { return fn(ctx, brokenScheduleTx{tx}) })
+}
+
+type brokenScheduleTx struct{ app.Tx }
+
+func (brokenScheduleTx) Reconciliation() app.ReconciliationStore { return brokenStore{} }
+
+type brokenStore struct{}
+
+func (brokenStore) Schedule(context.Context, domain.InstructionID, time.Time) error {
+	return errors.New("falha ao criar a tarefa")
+}
+
+func TestUnknownESuaTarefaSaoAtomicos(t *testing.T) {
+	requireInfra(t)
+	id := newAccepted(t, "e2e-11")
+	fake := &fakeParticipant{err: fmt.Errorf("%w: timeout", app.ErrOutcomeUnknown)}
+	uc := app.NewProcessInstruction(brokenScheduleUoW{inner: postgres.NewUnitOfWork(testPool)}, fake, testFirstDelay)
+
+	err := uc.Handle(context.Background(), acceptedMsg(id))
+
+	// A tarefa não pôde ser criada, então o RoutingTimedOut também não pode existir:
+	// nunca há unknown sem tarefa. A instrução fica em in_flight e nada é reenviado.
+	if !errors.Is(err, app.ErrOutcomeUnknown) {
+		t.Fatalf("erro = %v, esperado ErrOutcomeUnknown", err)
+	}
+	if p := load(t, id); p.Status() != domain.StatusInFlight || p.Version() != 2 {
+		t.Errorf("status=%s versão=%d; esperado in_flight, 2 (o evento foi desfeito)", p.Status(), p.Version())
+	}
+	if n, _, _ := tasks(t, id); n != 0 {
+		t.Errorf("tarefas = %d, esperado 0", n)
+	}
+	if fake.calls.Load() != 1 {
+		t.Errorf("envios = %d, esperado 1", fake.calls.Load())
 	}
 }
 
@@ -325,6 +411,7 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 		"accept": newAccepted(t, "accept:1"),
 		"reject": newAccepted(t, "reject:1"),
 		"late":   newAccepted(t, "late:1"),
+		"drop":   newAccepted(t, "drop:1"),
 	}
 	ours := make(map[string]bool)
 	for _, id := range ids {
@@ -359,7 +446,8 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 
 	waitStatus(t, ids["accept"], domain.StatusSettled)
 	waitStatus(t, ids["reject"], domain.StatusRejected)
-	waitStatus(t, ids["late"], domain.StatusInFlight)
+	waitStatus(t, ids["late"], domain.StatusUnknown)
+	waitStatus(t, ids["drop"], domain.StatusUnknown)
 
 	// O late processou no participante, o cliente desistiu, e nada foi reenviado.
 	time.Sleep(2 * time.Second) // passa o LateDelay e uma janela para um reenvio indevido aparecer
@@ -367,9 +455,14 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 		if got := participantReceived(t, srv.URL, id); got != 1 {
 			t.Errorf("%s: o participante recebeu %d vezes, esperado exatamente 1", name, got)
 		}
-	}
-	if p := load(t, ids["late"]); p.Status() != domain.StatusInFlight {
-		t.Errorf("late: status = %s, esperado in_flight até a conciliação (sessão 13)", p.Status())
+		// Só quem ficou em unknown tem tarefa de conciliação.
+		want := 0
+		if name == "late" || name == "drop" {
+			want = 1
+		}
+		if n, _, _ := tasks(t, id); n != want {
+			t.Errorf("%s: tarefas = %d, esperado %d", name, n, want)
+		}
 	}
 
 	cancel()

@@ -40,8 +40,9 @@ version.
 
 The simulated participant (the external counterparty) exists, and the processor routes each
 accepted instruction to it: without any intervention it reaches `settled` or `rejected`,
-going through Kafka. If the send gets no conclusive answer it stays `in_flight` and is never
-resent; reconciling it is Phase D. There is still no projection. The full plan is in
+going through Kafka. If the send gets no conclusive answer the instruction becomes `unknown`,
+with a reconciliation task created in the same transaction, and is never resent (session 13,
+Phase D). Nothing works those tasks yet, and there is still no projection. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Up and running in five minutes
@@ -72,7 +73,7 @@ curl -si localhost:8080/instructions \
 curl -s localhost:8080/instructions/<id> -H "Authorization: Bearer <access_token>"
 
 # 5. force a behavior with a prefix in end_to_end_id: "reject:1" ends in "rejected";
-#    "late:1" stays "in_flight" (the participant processed it, the answer came too late)
+#    "late:1" ends "unknown" (the participant processed it, the answer came too late)
 ```
 
 To see the instruction reach Kafka:
@@ -122,8 +123,9 @@ and records the answer. It is where the side effect lives (command side, never t
   repeated message, or two processors on the same message, send at most once.
 - **The send is outside any transaction**, and the answer is a second append (3 attempts).
 - **No conclusive answer is never resent.** A timeout, network error or `5xx` is an unknown
-  outcome: the offset advances and the instruction stays `in_flight`. Resending could charge
-  twice; the only safe operation is to query the status (Phase D).
+  outcome: the processor appends `RoutingTimedOut` (the instruction becomes `unknown`) and
+  creates its reconciliation task in the same transaction, then the offset advances. Resending
+  could charge twice; the only safe operation is to query the status (session 14).
 - **A transient error (database down) repeats the same message in place**, so order per
   partition holds and lag grows instead of anything being dropped.
 
@@ -132,6 +134,7 @@ and records the answer. It is where the side effect lives (command side, never t
 | `DATABASE_URL`, `KAFKA_BROKERS` | (required) | Postgres and Kafka |
 | `PARTICIPANT_URL` | (required) | e.g. `http://participant:9090` |
 | `PARTICIPANT_TIMEOUT` | `3s` | deadline of each send; `late` (10 s) does not fit, `slow` (1 s) does |
+| `RECONCILE_FIRST_DELAY` | `5s` | how long after the timeout the first status query is due |
 | `KAFKA_GROUP` | `payrouter-processor` | consumer group |
 
 ## Development
@@ -198,9 +201,10 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 
 ## Known limitations (v1)
 
-- A send with no conclusive answer leaves the instruction in `in_flight` forever: there is no
-  `RoutingTimedOut`, no `unknown` state and no reconciliation yet (sessions 13 to 15). The same
-  happens if the processor dies between claiming and sending.
+- An `unknown` instruction stays `unknown`: its reconciliation task is created, but nothing
+  reads it yet, so tasks pile up until the sweep and the status query exist (sessions 14 and 15).
+- An instruction can still stay `in_flight` forever if the processor dies between claiming and
+  sending, or if even the `unknown` record cannot be written.
 - There is no dead-letter queue: a message without the expected headers is logged and skipped.
 - The processor handles one message at a time (no worker pool yet).
 - The participant keeps its state in memory: a `crash` or restart forgets everything it

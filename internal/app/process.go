@@ -73,16 +73,18 @@ type Message struct {
 type ProcessInstruction struct {
 	uow         UnitOfWork
 	participant Participant
+	firstDelay  time.Duration // espera até a primeira consulta de conciliação
 }
 
-func NewProcessInstruction(uow UnitOfWork, participant Participant) *ProcessInstruction {
-	return &ProcessInstruction{uow: uow, participant: participant}
+func NewProcessInstruction(uow UnitOfWork, participant Participant, firstDelay time.Duration) *ProcessInstruction {
+	return &ProcessInstruction{uow: uow, participant: participant, firstDelay: firstDelay}
 }
 
 // Handle processa uma mensagem. Devolve nil quando a mensagem foi tratada ou não precisa de
-// tratamento (outro tipo de evento, repetida, já reivindicada por outro processor). Devolve
-// ErrOutcomeUnknown quando o envio foi feito e a resposta é desconhecida: o chamador NÃO deve
-// repetir a mensagem. Qualquer outro erro é transitório e a mensagem pode ser repetida.
+// tratamento (outro tipo de evento, repetida, já reivindicada por outro processor), inclusive
+// quando o envio ficou sem resposta e isso foi gravado como unknown. Devolve ErrOutcomeUnknown
+// só se nem o unknown pôde ser gravado: o chamador NÃO deve repetir a mensagem. Qualquer
+// outro erro é transitório e a mensagem pode ser repetida.
 func (uc *ProcessInstruction) Handle(ctx context.Context, msg Message) error {
 	if msg.EventType != string(domain.EventInstructionAccepted) {
 		return nil
@@ -142,7 +144,7 @@ func (uc *ProcessInstruction) Handle(ctx context.Context, msg Message) error {
 	// O efeito colateral. Daqui em diante um erro nunca autoriza reenviar.
 	result, err := uc.participant.Pay(ctx, request)
 	if err != nil {
-		return fmt.Errorf("instrução %s: %w", id, asUnknown(err))
+		return uc.recordUnknown(ctx, p, asUnknown(err))
 	}
 
 	return uc.apply(ctx, p, result)
@@ -167,26 +169,70 @@ func (uc *ProcessInstruction) apply(ctx context.Context, p *domain.PaymentInstru
 		return fmt.Errorf("instrução %s: %w", p.ID(), err)
 	}
 
-	// Repete só a gravação: reentregar a mensagem não ajudaria, pois a instrução já está em
-	// in_flight e ela seria pulada como repetida, perdendo a resposta que já temos.
+	err = uc.commit(ctx, p.ID(), expected, event, nil)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrConcurrencyConflict):
+		// Outro processo já resolveu a instrução (a conciliação, por exemplo).
+		slog.InfoContext(ctx, "processor: instrução já resolvida por outro caminho", "instruction_id", string(p.ID()))
+		return nil
+	}
+	// A instrução fica em in_flight; a conciliação consulta o participante e descobre o resultado.
+	return fmt.Errorf("instrução %s: resposta do participante não gravada: %w: %w", p.ID(), ErrOutcomeUnknown, err)
+}
+
+// recordUnknown grava que o envio ficou sem resposta conclusiva: o evento RoutingTimedOut e a
+// tarefa de conciliação na MESMA transação. Daqui em diante a instrução é unknown e quem a
+// resolve é a conciliação, consultando o status; nunca reenviando.
+func (uc *ProcessInstruction) recordUnknown(ctx context.Context, p *domain.PaymentInstruction, cause error) error {
+	expected := p.Version()
+	event, err := p.RecordTimeout()
+	if err != nil {
+		return fmt.Errorf("instrução %s: %w", p.ID(), err)
+	}
+	at := time.Now().Add(uc.firstDelay)
+	err = uc.commit(ctx, p.ID(), expected, event, func(ctx context.Context, tx Tx) error {
+		return tx.Reconciliation().Schedule(ctx, p.ID(), at)
+	})
+	switch {
+	case err == nil:
+		slog.WarnContext(ctx, "processor: resultado desconhecido gravado, aguardando conciliação",
+			"instruction_id", string(p.ID()), "first_attempt_at", at, "error", cause)
+		return nil
+	case errors.Is(err, ErrConcurrencyConflict):
+		slog.InfoContext(ctx, "processor: instrução já resolvida por outro caminho", "instruction_id", string(p.ID()))
+		return nil
+	}
+	// Nem o unknown foi gravado: fica em in_flight e a mensagem não será repetida.
+	return fmt.Errorf("instrução %s: timeout não gravado: %w: %w", p.ID(), ErrOutcomeUnknown, err)
+}
+
+// commit grava o evento na versão esperada, junto com also (se houver) na mesma transação.
+// Repete só a gravação, até applyAttempts vezes: reentregar a mensagem não ajudaria, pois a
+// instrução já está em in_flight e ela seria pulada como repetida, perdendo o que já sabemos.
+// Um conflito de versão encerra na hora e é devolvido ao chamador.
+func (uc *ProcessInstruction) commit(ctx context.Context, id domain.InstructionID, expected int, event domain.Event,
+	also func(ctx context.Context, tx Tx) error) error {
+	var err error
 	for attempt := range applyAttempts {
 		if attempt > 0 {
 			time.Sleep(applyPause)
 		}
 		err = uc.uow.Do(ctx, func(ctx context.Context, tx Tx) error {
-			return tx.Events().Append(ctx, p.ID(), expected, event)
+			if err := tx.Events().Append(ctx, id, expected, event); err != nil {
+				return err
+			}
+			if also == nil {
+				return nil
+			}
+			return also(ctx, tx)
 		})
-		if err == nil {
-			return nil
-		}
-		if errors.Is(err, ErrConcurrencyConflict) {
-			// Outro processo já resolveu a instrução (a conciliação, por exemplo).
-			slog.InfoContext(ctx, "processor: instrução já resolvida por outro caminho", "instruction_id", string(p.ID()))
-			return nil
+		if err == nil || errors.Is(err, ErrConcurrencyConflict) {
+			return err
 		}
 	}
-	// A instrução fica em in_flight; a conciliação consulta o participante e descobre o resultado.
-	return fmt.Errorf("instrução %s: resposta do participante não gravada: %w: %w", p.ID(), ErrOutcomeUnknown, err)
+	return err
 }
 
 // asUnknown garante que um erro do envio carregue ErrOutcomeUnknown: depois do Pay, não

@@ -27,12 +27,14 @@ func NewUnitOfWork(pool *pgxpool.Pool) *UnitOfWork {
 
 // txScope são os stores de uma transação aberta.
 type txScope struct {
-	events      *EventStore
-	idempotency *IdempotencyStore
+	events         *EventStore
+	idempotency    *IdempotencyStore
+	reconciliation *ReconciliationStore
 }
 
-func (t *txScope) Events() app.EventStore            { return t.events }
-func (t *txScope) Idempotency() app.IdempotencyStore { return t.idempotency }
+func (t *txScope) Events() app.EventStore                  { return t.events }
+func (t *txScope) Idempotency() app.IdempotencyStore       { return t.idempotency }
+func (t *txScope) Reconciliation() app.ReconciliationStore { return t.reconciliation }
 
 // Do roda fn numa transação. Erro de fn (ou pânico) desfaz tudo.
 func (u *UnitOfWork) Do(ctx context.Context, fn func(ctx context.Context, tx app.Tx) error) error {
@@ -43,7 +45,7 @@ func (u *UnitOfWork) Do(ctx context.Context, fn func(ctx context.Context, tx app
 	// Após o Commit, o Rollback é no-op; em erro ou pânico, é ele que desfaz.
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	scope := &txScope{events: NewEventStore(tx), idempotency: NewIdempotencyStore(tx)}
+	scope := &txScope{events: NewEventStore(tx), idempotency: NewIdempotencyStore(tx), reconciliation: NewReconciliationStore(tx)}
 	if err := fn(ctx, scope); err != nil {
 		return err
 	}

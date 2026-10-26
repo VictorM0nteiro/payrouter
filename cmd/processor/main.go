@@ -1,6 +1,6 @@
 // main.go
 // Ponto de entrada do processo processor: lê a configuração do ambiente (DATABASE_URL,
-// KAFKA_BROKERS, PARTICIPANT_URL, PARTICIPANT_TIMEOUT, KAFKA_GROUP, LOG_FORMAT), liga o
+// KAFKA_BROKERS, PARTICIPANT_URL, PARTICIPANT_TIMEOUT, RECONCILE_FIRST_DELAY, KAFKA_GROUP, LOG_FORMAT), liga o
 // consumidor Kafka ao caso de uso e roda até receber SIGINT/SIGTERM.
 // Objetivo: ser a composition root do processor, o lado do comando que produz o efeito
 // colateral (enviar ao participante). No desligamento termina a mensagem em andamento antes
@@ -30,6 +30,7 @@ const (
 	instructionsTopic  = "payrouter.instructions.events"
 	defaultGroup       = "payrouter-processor"
 	defaultPayTimeout  = 3 * time.Second
+	defaultFirstDelay  = 5 * time.Second
 	connectTimeout     = 5 * time.Second
 	maxConnLifetime    = 30 * time.Minute
 	healthCheckPeriod  = 30 * time.Second
@@ -59,6 +60,10 @@ func run() error {
 		return fmt.Errorf("PARTICIPANT_URL não definida (ex.: http://participant:9090)")
 	}
 	payTimeout, err := durationFromEnv("PARTICIPANT_TIMEOUT", defaultPayTimeout)
+	if err != nil {
+		return err
+	}
+	firstDelay, err := durationFromEnv("RECONCILE_FIRST_DELAY", defaultFirstDelay)
 	if err != nil {
 		return err
 	}
@@ -97,9 +102,10 @@ func run() error {
 	useCase := app.NewProcessInstruction(
 		postgres.NewUnitOfWork(pool),
 		participant.NewClient(participantURL, payTimeout),
+		firstDelay,
 	)
 	slog.Info("processor iniciado", "brokers", brokers, "group", group, "participant", participantURL,
-		"participant_timeout", payTimeout.String())
+		"participant_timeout", payTimeout.String(), "reconcile_first_delay", firstDelay.String())
 	err = consumer.Run(sigCtx, useCase.Handle)
 	slog.Info("processor encerrado")
 	return err

@@ -9,6 +9,7 @@ package app
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
 )
@@ -59,10 +60,20 @@ type IdempotencyStore interface {
 	Complete(ctx context.Context, key IdempotencyKey, aggregateID domain.InstructionID, responseBody []byte) error
 }
 
+// ReconciliationStore guarda a fila de trabalho da conciliação: uma tarefa por instrução em
+// unknown. É gravada na MESMA transação que o evento RoutingTimedOut, então não existe unknown
+// sem tarefa nem tarefa sem unknown.
+type ReconciliationStore interface {
+	// Schedule cria a tarefa da instrução para a primeira consulta em at. Idempotente: se a
+	// tarefa já existe, nada muda.
+	Schedule(ctx context.Context, id domain.InstructionID, at time.Time) error
+}
+
 // Tx é o conjunto de stores ligados a uma mesma transação de banco.
 type Tx interface {
 	Events() EventStore
 	Idempotency() IdempotencyStore
+	Reconciliation() ReconciliationStore
 }
 
 // UnitOfWork executa fn dentro de uma única transação. Se fn devolver erro, tudo é

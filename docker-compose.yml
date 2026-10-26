@@ -107,7 +107,7 @@ services:
 
   # Consome InstructionAccepted do Kafka, envia ao participante e grava a resposta. Idempotente
   # pela versão do agregado: mais de uma instância não envia a mesma instrução duas vezes. Um
-  # envio sem resposta (timeout) deixa a instrução em in_flight; nunca é reenviado.
+  # envio sem resposta (timeout) vira unknown, com a tarefa de conciliação; nunca é reenviado.
   processor:
     build: .
     entrypoint: ["processor"]
@@ -123,6 +123,7 @@ services:
       KAFKA_BROKERS: redpanda:9092
       PARTICIPANT_URL: http://participant:9090
       PARTICIPANT_TIMEOUT: ${PARTICIPANT_TIMEOUT:-3s}
+      RECONCILE_FIRST_DELAY: ${RECONCILE_FIRST_DELAY:-5s}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     restart: unless-stopped
     # Termina a mensagem em andamento ao receber SIGTERM; o envio tem prazo próprio.
