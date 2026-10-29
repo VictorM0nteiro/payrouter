@@ -145,3 +145,65 @@ func status(t *testing.T, srv *httptest.Server, id string) (int, map[string]any)
 	}
 	return resp.StatusCode, out
 }
+
+func TestStatusAceitaRejeitadaENaoEncontrada(t *testing.T) {
+	srv := newSim(t)
+	c := NewClient(srv.URL, 2*time.Second)
+	for _, id := range []string{"sa", "sr"} {
+		e2e := map[string]string{"sa": "accept:1", "sr": "reject:1"}[id]
+		if _, err := c.Pay(context.Background(), request(id, e2e)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := c.Status(context.Background(), "sa")
+	if err != nil || got.Status != app.PaymentAccepted {
+		t.Errorf("accepted = %+v, %v", got, err)
+	}
+	got, err = c.Status(context.Background(), "sr")
+	if err != nil || got.Status != app.PaymentRejected || got.Code != "insufficient_funds" {
+		t.Errorf("rejected = %+v, %v", got, err)
+	}
+	// 404 é "sem registro": uma resposta, não um erro, e nunca prova que nada foi processado.
+	got, err = c.Status(context.Background(), "nunca-vista")
+	if err != nil || got.Status != app.PaymentNotFound {
+		t.Errorf("not_found = %+v, %v", got, err)
+	}
+}
+
+func TestStatusDoLateMostraQueFoiProcessadaDepoisDoTimeout(t *testing.T) {
+	srv := newSim(t)
+	c := NewClient(srv.URL, 250*time.Millisecond)
+	if _, err := c.Pay(context.Background(), request("lt", "late:1")); !errors.Is(err, app.ErrOutcomeUnknown) {
+		t.Fatalf("Pay = %v, esperado ErrOutcomeUnknown", err)
+	}
+
+	got, err := c.Status(context.Background(), "lt")
+
+	if err != nil || got.Status != app.PaymentAccepted {
+		t.Errorf("Status = %+v, %v; esperado accepted: o participante processou apesar do timeout", got, err)
+	}
+}
+
+func TestStatusComFalhaViraResultadoDesconhecido(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{"http_500", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) }},
+		{"corpo_ilegivel", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("não é json")) }},
+		{"status_desconhecido", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"talvez"}`)) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			_, err := NewClient(srv.URL, time.Second).Status(context.Background(), "x")
+
+			if !errors.Is(err, app.ErrOutcomeUnknown) {
+				t.Errorf("erro = %v, esperado ErrOutcomeUnknown", err)
+			}
+		})
+	}
+}

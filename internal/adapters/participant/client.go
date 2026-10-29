@@ -1,5 +1,6 @@
 // client.go
-// Adapter HTTP da porta app.Participant: envia a instrução ao participante (POST /payments).
+// Adapter HTTP da porta app.Participant: envia a instrução ao participante (POST /payments) e
+// consulta o status dela (GET /payments/{id}).
 // Objetivo: traduzir a resposta HTTP na distinção que importa. 200 com accepted/rejected é
 // conclusivo; QUALQUER outra coisa (timeout, conexão caída, 5xx, corpo ilegível, até um 429
 // por enquanto) vira app.ErrOutcomeUnknown, porque a requisição pode ter chegado e ter sido
@@ -15,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -71,6 +73,30 @@ func (c *Client) Pay(ctx context.Context, req app.PaymentRequest) (app.PaymentRe
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	return decode(resp)
+}
+
+// Status consulta GET /payments/{id}. 404 é "o participante não tem registro" (not_found), que
+// não prova que nada foi processado; tudo que não for uma resposta conclusiva é ErrOutcomeUnknown.
+func (c *Client) Status(ctx context.Context, id string) (app.PaymentResult, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/payments/"+url.PathEscape(id), nil)
+	if err != nil {
+		return app.PaymentResult{}, fmt.Errorf("%w: %w", app.ErrOutcomeUnknown, err)
+	}
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return app.PaymentResult{}, fmt.Errorf("%w: %w", app.ErrOutcomeUnknown, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return app.PaymentResult{Status: app.PaymentNotFound}, nil
+	}
+	return decode(resp)
+}
+
+// decode lê uma resposta 200 do participante (Pay e Status usam o mesmo formato).
+func decode(resp *http.Response) (app.PaymentResult, error) {
 	if resp.StatusCode != http.StatusOK {
 		return app.PaymentResult{}, fmt.Errorf("%w: participante respondeu %d", app.ErrOutcomeUnknown, resp.StatusCode)
 	}

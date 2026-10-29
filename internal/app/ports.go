@@ -64,6 +64,10 @@ type IdempotencyStore interface {
 // unknown. É gravada na MESMA transação que o evento RoutingTimedOut, então não existe unknown
 // sem tarefa nem tarefa sem unknown.
 type ReconciliationStore interface {
+	// Schedule cria a tarefa da instrução para a primeira consulta em at. Idempotente: se a
+	// tarefa já existe, nada muda.
+	Schedule(ctx context.Context, id domain.InstructionID, at time.Time) error
+
 	// Claim reivindica até limit tarefas vencidas (next_attempt_at <= agora), empurrando o
 	// vencimento delas em lease. Vários processors nunca recebem a mesma tarefa; se quem
 	// reivindicou cair, a tarefa volta à fila quando o lease vencer.

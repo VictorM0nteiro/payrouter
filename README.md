@@ -42,7 +42,10 @@ The simulated participant (the external counterparty) exists, and the processor 
 accepted instruction to it: without any intervention it reaches `settled` or `rejected`,
 going through Kafka. If the send gets no conclusive answer the instruction becomes `unknown`,
 with a reconciliation task created in the same transaction, and is never resent (session 13,
-Phase D). Nothing works those tasks yet, and there is still no projection. The full plan is in
+Phase D). The reconciliation loop (session 14) then asks the participant for the status of each
+`unknown` instruction, with backoff and jitter, and resolves it from the answer: a `late`
+instruction that timed out ends `settled` by itself. There is no limit on attempts yet, and
+there is still no projection. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Up and running in five minutes
@@ -125,9 +128,27 @@ and records the answer. It is where the side effect lives (command side, never t
 - **No conclusive answer is never resent.** A timeout, network error or `5xx` is an unknown
   outcome: the processor appends `RoutingTimedOut` (the instruction becomes `unknown`) and
   creates its reconciliation task in the same transaction, then the offset advances. Resending
-  could charge twice; the only safe operation is to query the status (session 14).
+  could charge twice; the only safe operation is to query the status.
 - **A transient error (database down) repeats the same message in place**, so order per
   partition holds and lag grows instead of anything being dropped.
+
+### Reconciliation
+
+A loop inside the processor works the `reconciliation_tasks` queue.
+
+- **Sweep with a lease.** Each round claims the due tasks (`next_attempt_at <= now()`) with
+  `FOR UPDATE SKIP LOCKED` and pushes their due time forward by a lease, in one statement. Two
+  processors never get the same task; if one dies mid-query, the task comes back when the lease
+  expires.
+- **The status query resolves it, never a resend.** `GET /payments/{id}` on the participant:
+  `accepted` appends `StatusQueried` + `ParticipantAccepted`, `rejected` appends `StatusQueried`
+  + `ParticipantRejected`, and the task is deleted, all in one transaction. `404 not_found` or a
+  failed query appends `StatusQueried{unknown}` and reschedules the task. `not_found` is not
+  taken as "not processed": a participant that lost the message and one that has not caught up
+  look the same, so nothing is resent.
+- **Backoff with jitter.** The wait doubles on each attempt from `RECONCILE_BACKOFF_BASE` up to
+  `RECONCILE_BACKOFF_MAX`; half of it is fixed and half is random, so tasks that failed together
+  do not query together and the wait never falls near zero.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -135,6 +156,10 @@ and records the answer. It is where the side effect lives (command side, never t
 | `PARTICIPANT_URL` | (required) | e.g. `http://participant:9090` |
 | `PARTICIPANT_TIMEOUT` | `3s` | deadline of each send; `late` (10 s) does not fit, `slow` (1 s) does |
 | `RECONCILE_FIRST_DELAY` | `5s` | how long after the timeout the first status query is due |
+| `RECONCILE_BATCH` | `50` | tasks claimed per round |
+| `RECONCILE_POLL` | `1s` | wait between empty rounds |
+| `RECONCILE_LEASE` | `30s` | how long a claimed task stays out of the queue |
+| `RECONCILE_BACKOFF_BASE`, `RECONCILE_BACKOFF_MAX` | `5s`, `1m` | wait between status queries: doubles from the base, capped at the max |
 | `KAFKA_GROUP` | `payrouter-processor` | consumer group |
 
 ## Development
@@ -201,8 +226,10 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 
 ## Known limitations (v1)
 
-- An `unknown` instruction stays `unknown`: its reconciliation task is created, but nothing
-  reads it yet, so tasks pile up until the sweep and the status query exist (sessions 14 and 15).
+- An `unknown` instruction that the participant never recognizes (for example `drop`) is queried
+  forever, with growing waits: there is no `ReconciliationExhausted` yet (session 15).
+- The reconciliation queries one task at a time, so a large batch of slow queries can outlast the
+  lease and a task may be queried twice. Queries are safe and the write is guarded by the version.
 - An instruction can still stay `in_flight` forever if the processor dies between claiming and
   sending, or if even the `unknown` record cannot be written.
 - There is no dead-letter queue: a message without the expected headers is logged and skipped.

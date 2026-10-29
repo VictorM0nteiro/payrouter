@@ -1,6 +1,7 @@
 // main.go
 // Ponto de entrada do processo processor: lê a configuração do ambiente (DATABASE_URL,
-// KAFKA_BROKERS, PARTICIPANT_URL, PARTICIPANT_TIMEOUT, RECONCILE_FIRST_DELAY, KAFKA_GROUP, LOG_FORMAT), liga o
+// KAFKA_BROKERS, PARTICIPANT_URL, PARTICIPANT_TIMEOUT, RECONCILE_FIRST_DELAY, RECONCILE_BATCH, RECONCILE_POLL, RECONCILE_LEASE,
+// RECONCILE_BACKOFF_BASE, RECONCILE_BACKOFF_MAX, KAFKA_GROUP, LOG_FORMAT), liga o
 // consumidor Kafka ao caso de uso e roda até receber SIGINT/SIGTERM.
 // Objetivo: ser a composition root do processor, o lado do comando que produz o efeito
 // colateral (enviar ao participante). No desligamento termina a mensagem em andamento antes
@@ -14,7 +15,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +34,11 @@ const (
 	defaultGroup       = "payrouter-processor"
 	defaultPayTimeout  = 3 * time.Second
 	defaultFirstDelay  = 5 * time.Second
+	defaultBatch       = 50
+	defaultPoll        = time.Second
+	defaultLease       = 30 * time.Second
+	defaultBackoffBase = 5 * time.Second
+	defaultBackoffMax  = time.Minute
 	connectTimeout     = 5 * time.Second
 	maxConnLifetime    = 30 * time.Minute
 	healthCheckPeriod  = 30 * time.Second
@@ -67,6 +75,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	reconcile, err := reconcileConfig()
+	if err != nil {
+		return err
+	}
 	group := os.Getenv("KAFKA_GROUP")
 	if group == "" {
 		group = defaultGroup
@@ -99,16 +111,65 @@ func run() error {
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	useCase := app.NewProcessInstruction(
-		postgres.NewUnitOfWork(pool),
-		participant.NewClient(participantURL, payTimeout),
-		firstDelay,
-	)
+	uow := postgres.NewUnitOfWork(pool)
+	client := participant.NewClient(participantURL, payTimeout)
+	useCase := app.NewProcessInstruction(uow, client, firstDelay)
+	reconciler := app.NewReconcile(uow, client, reconcile)
 	slog.Info("processor iniciado", "brokers", brokers, "group", group, "participant", participantURL,
-		"participant_timeout", payTimeout.String(), "reconcile_first_delay", firstDelay.String())
+		"participant_timeout", payTimeout.String(), "reconcile_first_delay", firstDelay.String(),
+		"reconcile_poll", reconcile.Poll.String(), "reconcile_backoff_base", reconcile.BackoffBase.String(),
+		"reconcile_backoff_max", reconcile.BackoffMax.String())
+
+	// A conciliação roda ao lado do consumidor; os dois param com o mesmo sinal.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = reconciler.Run(sigCtx)
+	}()
 	err = consumer.Run(sigCtx, useCase.Handle)
+	stop()
+	wg.Wait()
 	slog.Info("processor encerrado")
 	return err
+}
+
+// reconcileConfig lê os parâmetros do laço de conciliação; valor inválido impede a partida.
+func reconcileConfig() (app.ReconcileConfig, error) {
+	var cfg app.ReconcileConfig
+	var err error
+	if cfg.Batch, err = intFromEnv("RECONCILE_BATCH", defaultBatch); err != nil {
+		return cfg, err
+	}
+	if cfg.Poll, err = durationFromEnv("RECONCILE_POLL", defaultPoll); err != nil {
+		return cfg, err
+	}
+	if cfg.Lease, err = durationFromEnv("RECONCILE_LEASE", defaultLease); err != nil {
+		return cfg, err
+	}
+	if cfg.BackoffBase, err = durationFromEnv("RECONCILE_BACKOFF_BASE", defaultBackoffBase); err != nil {
+		return cfg, err
+	}
+	if cfg.BackoffMax, err = durationFromEnv("RECONCILE_BACKOFF_MAX", defaultBackoffMax); err != nil {
+		return cfg, err
+	}
+	if cfg.BackoffMax < cfg.BackoffBase {
+		return cfg, fmt.Errorf("RECONCILE_BACKOFF_MAX (%s) menor que RECONCILE_BACKOFF_BASE (%s)", cfg.BackoffMax, cfg.BackoffBase)
+	}
+	return cfg, nil
+}
+
+// intFromEnv lê um inteiro positivo da variável, ou devolve def se ela estiver vazia.
+func intFromEnv(name string, def int) (int, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s: %q não é um inteiro positivo", name, raw)
+	}
+	return n, nil
 }
 
 // splitList separa uma lista por vírgula, ignorando espaços e itens vazios.

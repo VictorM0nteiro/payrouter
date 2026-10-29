@@ -124,6 +124,9 @@ services:
       PARTICIPANT_URL: http://participant:9090
       PARTICIPANT_TIMEOUT: ${PARTICIPANT_TIMEOUT:-3s}
       RECONCILE_FIRST_DELAY: ${RECONCILE_FIRST_DELAY:-5s}
+      RECONCILE_POLL: ${RECONCILE_POLL:-1s}
+      RECONCILE_BACKOFF_BASE: ${RECONCILE_BACKOFF_BASE:-5s}
+      RECONCILE_BACKOFF_MAX: ${RECONCILE_BACKOFF_MAX:-1m}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     restart: unless-stopped
     # Termina a mensagem em andamento ao receber SIGTERM; o envio tem prazo próprio.

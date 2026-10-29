@@ -6,6 +6,7 @@
 // partir da resposta dele; se não sabe (not_found, timeout, erro), a consulta é registrada e a
 // tarefa volta à fila mais tarde. Cada tarefa é reivindicada com um lease, então vários
 // processors nunca consultam a mesma, e uma queda no meio só adia a tarefa até o lease vencer.
+
 package app
 
 import (
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
@@ -21,7 +23,7 @@ import (
 // ReconciliationTask é uma instrução em unknown à espera de consulta.
 type ReconciliationTask struct {
 	ID       domain.InstructionID
-	Attempts int
+	Attempts int // consultas já feitas
 }
 
 // ReconcileConfig parametriza o laço. Todos os campos são obrigatórios e positivos.
@@ -105,7 +107,6 @@ func (r *Reconcile) Run(ctx context.Context) error {
 	return nil
 }
 
-// reconcile consulta uma tarefa reivindicada e grava o que o participante respondeu.
 // reconcile consulta uma tarefa reivindicada e grava o que o participante respondeu.
 func (r *Reconcile) reconcile(ctx context.Context, t ReconciliationTask) error {
 	var p *domain.PaymentInstruction

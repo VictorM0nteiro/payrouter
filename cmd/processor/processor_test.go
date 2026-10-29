@@ -71,6 +71,16 @@ type fakeParticipant struct {
 	result app.PaymentResult
 	err    error
 	delay  time.Duration
+
+	// Resposta à consulta de status (conciliação).
+	statusCalls  atomic.Int32
+	statusResult app.PaymentResult
+	statusErr    error
+}
+
+func (f *fakeParticipant) Status(_ context.Context, _ string) (app.PaymentResult, error) {
+	f.statusCalls.Add(1)
+	return f.statusResult, f.statusErr
 }
 
 func (f *fakeParticipant) Pay(_ context.Context, _ app.PaymentRequest) (app.PaymentResult, error) {
@@ -333,7 +343,7 @@ type brokenScheduleTx struct{ app.Tx }
 
 func (brokenScheduleTx) Reconciliation() app.ReconciliationStore { return brokenStore{} }
 
-type brokenStore struct{}
+type brokenStore struct{ app.ReconciliationStore }
 
 func (brokenStore) Schedule(context.Context, domain.InstructionID, time.Time) error {
 	return errors.New("falha ao criar a tarefa")
@@ -434,7 +444,14 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer consumer.Close()
-	uc := newUseCase(pclient.NewClient(srv.URL, 500*time.Millisecond))
+	client := pclient.NewClient(srv.URL, 500*time.Millisecond)
+	uc := app.NewProcessInstruction(postgres.NewUnitOfWork(testPool), client, 200*time.Millisecond)
+	reconciler := app.NewReconcile(postgres.NewUnitOfWork(testPool), client, app.ReconcileConfig{
+		Batch: 10, Lease: 30 * time.Second, Poll: 100 * time.Millisecond,
+		BackoffBase: 200 * time.Millisecond, BackoffMax: time.Second,
+	})
+	reconcilerDone := make(chan error, 1)
+	go func() { reconcilerDone <- reconciler.Run(ctx) }()
 	handle := func(ctx context.Context, m app.Message) error {
 		if !ours[m.AggregateID] { // o tópico é compartilhado com os outros testes do pacote
 			return nil
@@ -446,8 +463,13 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 
 	waitStatus(t, ids["accept"], domain.StatusSettled)
 	waitStatus(t, ids["reject"], domain.StatusRejected)
-	waitStatus(t, ids["late"], domain.StatusUnknown)
+	// late: o envio deu timeout (unknown) e a conciliação descobriu, pela consulta, que o
+	// participante tinha processado. Resolve sozinho, sem reenviar.
+	waitStatus(t, ids["late"], domain.StatusSettled)
+	// drop: o participante nunca processou e a consulta não acha nada. Segue unknown, e a
+	// conciliação continua tentando, com intervalos crescentes.
 	waitStatus(t, ids["drop"], domain.StatusUnknown)
+	waitFor(t, "2 consultas do drop", func() bool { _, attempts, _ := tasks(t, ids["drop"]); return attempts >= 2 })
 
 	// O late processou no participante, o cliente desistiu, e nada foi reenviado.
 	time.Sleep(2 * time.Second) // passa o LateDelay e uma janela para um reenvio indevido aparecer
@@ -455,9 +477,9 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 		if got := participantReceived(t, srv.URL, id); got != 1 {
 			t.Errorf("%s: o participante recebeu %d vezes, esperado exatamente 1", name, got)
 		}
-		// Só quem ficou em unknown tem tarefa de conciliação.
+		// Só quem segue unknown tem tarefa de conciliação.
 		want := 0
-		if name == "late" || name == "drop" {
+		if name == "drop" {
 			want = 1
 		}
 		if n, _, _ := tasks(t, id); n != want {
@@ -472,6 +494,21 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 	if err := <-consumerDone; err != nil {
 		t.Errorf("consumer: %v", err)
 	}
+	if err := <-reconcilerDone; err != nil {
+		t.Errorf("reconciler: %v", err)
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timeout esperando: %s", what)
 }
 
 func waitStatus(t *testing.T, id domain.InstructionID, want domain.Status) {
