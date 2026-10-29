@@ -33,6 +33,7 @@ type ReconcileConfig struct {
 	Poll        time.Duration // espera entre rodadas vazias
 	BackoffBase time.Duration // espera antes da 2ª consulta; dobra a cada tentativa
 	BackoffMax  time.Duration // teto da espera
+	MaxAttempts int           // consultas sem conclusão antes de desistir (unknown -> failed)
 }
 
 // Reconcile é o caso de uso.
@@ -129,7 +130,7 @@ func (r *Reconcile) reconcile(ctx context.Context, t ReconciliationTask) error {
 	// A consulta acontece fora de qualquer transação. Falha ou not_found não resolvem nada.
 	res, qerr := r.participant.Status(ctx, string(t.ID))
 	expected := p.Version() // lida ANTES dos comandos: depois deles já é a versão nova
-	events, resolved, err := r.apply(p, res, qerr)
+	events, resolved, err := r.apply(p, res, qerr, t.Attempts+1)
 	if err != nil {
 		return err
 	}
@@ -158,7 +159,7 @@ func (r *Reconcile) reconcile(ctx context.Context, t ReconciliationTask) error {
 
 // apply registra a consulta no agregado e, se a resposta for conclusiva, o desfecho. Devolve
 // os eventos a gravar e se a instrução ficou resolvida.
-func (r *Reconcile) apply(p *domain.PaymentInstruction, res PaymentResult, qerr error) ([]domain.Event, bool, error) {
+func (r *Reconcile) apply(p *domain.PaymentInstruction, res PaymentResult, qerr error, attempt int) ([]domain.Event, bool, error) {
 	result, resolve := domain.QueryUnknown, func() (domain.Event, error) { return nil, nil }
 	if qerr == nil {
 		switch res.Status {
@@ -177,7 +178,14 @@ func (r *Reconcile) apply(p *domain.PaymentInstruction, res PaymentResult, qerr 
 		return nil, false, fmt.Errorf("instrução %s: %w", p.ID(), err)
 	}
 	if outcome == nil {
-		return []domain.Event{queried}, false, nil
+		if attempt < r.cfg.MaxAttempts {
+			return []domain.Event{queried}, false, nil
+		}
+		exhausted, err := p.Exhaust(attempt)
+		if err != nil {
+			return nil, false, fmt.Errorf("instrução %s: %w", p.ID(), err)
+		}
+		return []domain.Event{queried, exhausted}, true, nil
 	}
 	return []domain.Event{queried, outcome}, true, nil
 }

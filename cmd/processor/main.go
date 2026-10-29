@@ -1,7 +1,7 @@
 // main.go
 // Ponto de entrada do processo processor: lê a configuração do ambiente (DATABASE_URL,
 // KAFKA_BROKERS, PARTICIPANT_URL, PARTICIPANT_TIMEOUT, RECONCILE_FIRST_DELAY, RECONCILE_BATCH, RECONCILE_POLL, RECONCILE_LEASE,
-// RECONCILE_BACKOFF_BASE, RECONCILE_BACKOFF_MAX, KAFKA_GROUP, LOG_FORMAT), liga o
+// RECONCILE_BACKOFF_BASE, RECONCILE_BACKOFF_MAX,  RECONCILE_MAX_ATTEMPTS, KAFKA_GROUP, LOG_FORMAT), liga o
 // consumidor Kafka ao caso de uso e roda até receber SIGINT/SIGTERM.
 // Objetivo: ser a composition root do processor, o lado do comando que produz o efeito
 // colateral (enviar ao participante). No desligamento termina a mensagem em andamento antes
@@ -39,6 +39,7 @@ const (
 	defaultLease       = 30 * time.Second
 	defaultBackoffBase = 5 * time.Second
 	defaultBackoffMax  = time.Minute
+	defaultMaxAttempts = 10
 	connectTimeout     = 5 * time.Second
 	maxConnLifetime    = 30 * time.Minute
 	healthCheckPeriod  = 30 * time.Second
@@ -118,7 +119,7 @@ func run() error {
 	slog.Info("processor iniciado", "brokers", brokers, "group", group, "participant", participantURL,
 		"participant_timeout", payTimeout.String(), "reconcile_first_delay", firstDelay.String(),
 		"reconcile_poll", reconcile.Poll.String(), "reconcile_backoff_base", reconcile.BackoffBase.String(),
-		"reconcile_backoff_max", reconcile.BackoffMax.String())
+		"reconcile_backoff_max", reconcile.BackoffMax.String(), "reconcile_max_attempts", reconcile.MaxAttempts )
 
 	// A conciliação roda ao lado do consumidor; os dois param com o mesmo sinal.
 	var wg sync.WaitGroup
@@ -151,6 +152,9 @@ func reconcileConfig() (app.ReconcileConfig, error) {
 		return cfg, err
 	}
 	if cfg.BackoffMax, err = durationFromEnv("RECONCILE_BACKOFF_MAX", defaultBackoffMax); err != nil {
+		return cfg, err
+	}
+	if cfg.MaxAttempts, err = intFromEnv("RECONCILE_MAX_ATTEMPTS", defaultMaxAttempts); err != nil {
 		return cfg, err
 	}
 	if cfg.BackoffMax < cfg.BackoffBase {

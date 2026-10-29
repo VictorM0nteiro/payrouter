@@ -127,6 +127,7 @@ services:
       RECONCILE_POLL: ${RECONCILE_POLL:-1s}
       RECONCILE_BACKOFF_BASE: ${RECONCILE_BACKOFF_BASE:-5s}
       RECONCILE_BACKOFF_MAX: ${RECONCILE_BACKOFF_MAX:-1m}
+      RECONCILE_MAX_ATTEMPTS: ${RECONCILE_MAX_ATTEMPTS:-10}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     restart: unless-stopped
     # Termina a mensagem em andamento ao receber SIGTERM; o envio tem prazo próprio.
