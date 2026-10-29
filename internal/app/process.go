@@ -37,6 +37,13 @@ type PaymentStatus string
 const (
 	PaymentAccepted PaymentStatus = "accepted"
 	PaymentRejected PaymentStatus = "rejected"
+	// PaymentNotFound só existe na resposta a uma consulta: o participante não tem registro.
+        // Não prova que nada foi processado, então nunca autoriza reenviar.
+        PaymentNotFound PaymentStatus = "not_found"
+        // Status consulta o que o participante sabe da instrução. É a única operação segura depois
+        // de um timeout. Devolve accepted, rejected (com o código) ou not_found; qualquer falha é
+        // ErrOutcomeUnknown.
+        Status(ctx context.Context, id string) (PaymentResult, error)
 )
 
 // PaymentRequest é o que se envia ao participante. O valor é sempre int64 de centavos.

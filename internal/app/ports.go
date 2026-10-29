@@ -64,9 +64,17 @@ type IdempotencyStore interface {
 // unknown. É gravada na MESMA transação que o evento RoutingTimedOut, então não existe unknown
 // sem tarefa nem tarefa sem unknown.
 type ReconciliationStore interface {
-	// Schedule cria a tarefa da instrução para a primeira consulta em at. Idempotente: se a
-	// tarefa já existe, nada muda.
-	Schedule(ctx context.Context, id domain.InstructionID, at time.Time) error
+	// Claim reivindica até limit tarefas vencidas (next_attempt_at <= agora), empurrando o
+	// vencimento delas em lease. Vários processors nunca recebem a mesma tarefa; se quem
+	// reivindicou cair, a tarefa volta à fila quando o lease vencer.
+	Claim(ctx context.Context, limit int, lease time.Duration) ([]ReconciliationTask, error)
+
+	// Reschedule registra mais uma consulta sem conclusão: soma 1 às tentativas e marca a
+	// próxima para at.
+	Reschedule(ctx context.Context, id domain.InstructionID, at time.Time) error
+
+	// Complete retira a tarefa da fila: a instrução foi resolvida.
+	Complete(ctx context.Context, id domain.InstructionID) error
 }
 
 // Tx é o conjunto de stores ligados a uma mesma transação de banco.
