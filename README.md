@@ -45,8 +45,9 @@ with a reconciliation task created in the same transaction, and is never resent 
 Phase D). The reconciliation loop (session 14) then asks the participant for the status of each
 `unknown` instruction, with backoff and jitter, and resolves it from the answer: a `late`
 instruction that timed out ends `settled` by itself. After `RECONCILE_MAX_ATTEMPTS` queries
-without a conclusion it gives up and the instruction becomes `failed` (session 15), and there is
-still no projection. The full plan is in
+without a conclusion it gives up and the instruction becomes `failed` (session 15). One
+end-to-end test runs all six participant behaviors through the whole pipeline (session 16), and
+there is still no projection. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Up and running in five minutes
@@ -105,6 +106,19 @@ many times each instruction arrived (`received`).
 | `drop` | no | never answers; the status query finds nothing |
 | `late` | yes, at once | `accepted` only after `LATE_DELAY` (10 s), when the client already gave up: the cruel case |
 | `crash` | no | the process exits; compose restarts it |
+
+What the processor does with each one is pinned by `TestPontaAPontaDosSeisComportamentos`
+(`cmd/processor`), which checks the exact event trail and that the participant received the
+instruction once:
+
+| Behavior | Ends | Trail after `InstructionAccepted` |
+|---|---|---|
+| `accept`, `slow` | `settled` (`slow` never becomes `unknown`) | `RoutingAttempted`, `ParticipantAccepted` |
+| `reject` | `rejected` | `RoutingAttempted`, `ParticipantRejected` |
+| `late` | `settled` via status query | `RoutingAttempted`, `RoutingTimedOut`, `StatusQueried`, `ParticipantAccepted` |
+| `drop`, `crash` | `failed` | `RoutingAttempted`, `RoutingTimedOut`, `StatusQueried` x N, `ReconciliationExhausted` |
+
+`drop` and `crash` look the same to the processor: both end `unknown`, then `failed`, and nothing is resent.
 
 `PARTICIPANT_BEHAVIOR` sets the default (`accept`). A prefix in `end_to_end_id` forces the
 behavior of one instruction, for example `late:order-1`. The status query is

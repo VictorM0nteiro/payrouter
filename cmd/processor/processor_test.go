@@ -4,7 +4,7 @@
 // a mensagem repetida ou com vários processors disputando a mesma; um envio sem resposta deixa
 // a instrução em unknown, com a tarefa de conciliação gravada na mesma transação, e nunca é
 // reenviado; e, de ponta a ponta (outbox, relay, Kafka, processor, participante), uma instrução
-// aceita chega a settled, rejected ou unknown sozinha.
+// aceita chega sozinha ao desfecho certo para cada um dos seis comportamentos do participante.
 
 package main
 
@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -407,24 +408,45 @@ func TestAgregadoInexistenteEErroTransitorio(t *testing.T) {
 	}
 }
 
-// TestPontaAPontaPeloKafka percorre o caminho inteiro: evento + outbox no Postgres, relay,
-// Redpanda, consumidor, caso de uso, participante simulado de verdade (HTTP).
-func TestPontaAPontaPeloKafka(t *testing.T) {
+// TestPontaAPontaDosSeisComportamentos percorre o caminho inteiro com os seis comportamentos do
+// participante ao mesmo tempo: evento + outbox no Postgres, relay, Redpanda, consumidor, caso de
+// uso, participante simulado de verdade (HTTP) e conciliação. Para cada um confere o desfecho e a
+// trilha EXATA de eventos, e que o participante recebeu a instrução uma vez só (nada é reenviado).
+// O que os seis provam juntos: o processor não confunde os casos. Resposta lenta que ainda cabe
+// no prazo não é unknown; resposta tardia é unknown que a conciliação liquida; mensagem perdida e
+// queda do participante são indistinguíveis para ele (unknown e depois failed).
+func TestPontaAPontaDosSeisComportamentos(t *testing.T) {
 	requireInfra(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	srv := httptest.NewServer(sim.New(sim.Config{LateDelay: 1500 * time.Millisecond}))
+	var exits atomic.Int32
+	srv := httptest.NewServer(sim.New(sim.Config{
+		SlowDelay: 200 * time.Millisecond,  // cabe no prazo de 500 ms do cliente
+		LateDelay: 1500 * time.Millisecond, // não cabe
+		Exit:      func(int) { exits.Add(1) },
+	}))
 	defer srv.Close()
 
-	ids := map[string]domain.InstructionID{
-		"accept": newAccepted(t, "accept:1"),
-		"reject": newAccepted(t, "reject:1"),
-		"late":   newAccepted(t, "late:1"),
-		"drop":   newAccepted(t, "drop:1"),
+	const maxAttempts = 3
+	consulta := strings.Repeat(",StatusQueried", maxAttempts)
+	cases := []struct {
+		behavior string
+		status   domain.Status
+		trail    string // eventos depois de InstructionAccepted
+	}{
+		{"accept", domain.StatusSettled, "RoutingAttempted,ParticipantAccepted"},
+		{"reject", domain.StatusRejected, "RoutingAttempted,ParticipantRejected"},
+		{"slow", domain.StatusSettled, "RoutingAttempted,ParticipantAccepted"},
+		{"late", domain.StatusSettled, "RoutingAttempted,RoutingTimedOut,StatusQueried,ParticipantAccepted"},
+		{"drop", domain.StatusFailed, "RoutingAttempted,RoutingTimedOut" + consulta + ",ReconciliationExhausted"},
+		{"crash", domain.StatusFailed, "RoutingAttempted,RoutingTimedOut" + consulta + ",ReconciliationExhausted"},
 	}
+	ids := make(map[string]domain.InstructionID)
 	ours := make(map[string]bool)
-	for _, id := range ids {
+	for _, c := range cases {
+		id := newAccepted(t, c.behavior+":e2e")
+		ids[c.behavior] = id
 		ours[string(id)] = true
 	}
 
@@ -438,7 +460,7 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 	relayDone := make(chan error, 1)
 	go func() { relayDone <- relay.Run(ctx) }()
 
-	// Processor: Kafka -> caso de uso -> participante. O prazo (500ms) é menor que o atraso do late.
+	// Processor: Kafka -> caso de uso -> participante. O prazo (500 ms) é menor que o atraso do late.
 	consumer, err := kafka.NewConsumer(testBrokers, fmt.Sprintf("e2e-%d", time.Now().UnixNano()), instructionsTopic)
 	if err != nil {
 		t.Fatal(err)
@@ -448,7 +470,7 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 	uc := app.NewProcessInstruction(postgres.NewUnitOfWork(testPool), client, 200*time.Millisecond)
 	reconciler := app.NewReconcile(postgres.NewUnitOfWork(testPool), client, app.ReconcileConfig{
 		Batch: 10, Lease: 30 * time.Second, Poll: 100 * time.Millisecond,
-		BackoffBase: 200 * time.Millisecond, BackoffMax: time.Second, MaxAttempts: 3,
+		BackoffBase: 200 * time.Millisecond, BackoffMax: time.Second, MaxAttempts: maxAttempts,
 	})
 	reconcilerDone := make(chan error, 1)
 	go func() { reconcilerDone <- reconciler.Run(ctx) }()
@@ -461,25 +483,34 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 	consumerDone := make(chan error, 1)
 	go func() { consumerDone <- consumer.Run(ctx, handle) }()
 
-	waitStatus(t, ids["accept"], domain.StatusSettled)
-	waitStatus(t, ids["reject"], domain.StatusRejected)
-	// late: o envio deu timeout (unknown) e a conciliação descobriu, pela consulta, que o
-	// participante tinha processado. Resolve sozinho, sem reenviar.
-	waitStatus(t, ids["late"], domain.StatusSettled)
-	// drop: o participante nunca processou e a consulta não acha nada. A conciliação tenta
-	// MaxAttempts vezes, com intervalos crescentes, e desiste: failed, sem reenviar.
-	waitStatus(t, ids["drop"], domain.StatusFailed)
+	for _, c := range cases {
+		waitStatus(t, ids[c.behavior], c.status)
+	}
 
-	// O late processou no participante, o cliente desistiu, e nada foi reenviado.
-	time.Sleep(2 * time.Second) // passa o LateDelay e uma janela para um reenvio indevido aparecer
-	for name, id := range ids {
+	// Passa o LateDelay e uma janela para um reenvio indevido, ou uma resposta tardia, aparecer.
+	time.Sleep(2 * time.Second)
+	for _, c := range cases {
+		id := ids[c.behavior]
+		if got := load(t, id).Status(); got != c.status {
+			t.Errorf("%s: status = %s, esperado %s", c.behavior, got, c.status)
+		}
+		want := "InstructionAccepted," + c.trail
+		if got := join(eventTypes(t, id)); got != want {
+			t.Errorf("%s: eventos = %s, esperado %s", c.behavior, got, want)
+		}
 		if got := participantReceived(t, srv.URL, id); got != 1 {
-			t.Errorf("%s: o participante recebeu %d vezes, esperado exatamente 1", name, got)
+			t.Errorf("%s: o participante recebeu %d vezes, esperado exatamente 1", c.behavior, got)
 		}
 		// Resolvida ou esgotada, nenhuma instrução deixa tarefa na fila.
 		if n, _, _ := tasks(t, id); n != 0 {
-			t.Errorf("%s: tarefas = %d, esperado 0", name, n)
+			t.Errorf("%s: tarefas = %d, esperado 0", c.behavior, n)
 		}
+	}
+	if got := lastPayload(t, ids["reject"]); got != `{"code": "insufficient_funds"}` {
+		t.Errorf("reject: payload do desfecho = %s", got)
+	}
+	if got := exits.Load(); got != 1 {
+		t.Errorf("o participante caiu %d vezes, esperado 1 (só o crash)", got)
 	}
 
 	cancel()
