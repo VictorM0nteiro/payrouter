@@ -44,8 +44,9 @@ going through Kafka. If the send gets no conclusive answer the instruction becom
 with a reconciliation task created in the same transaction, and is never resent (session 13,
 Phase D). The reconciliation loop (session 14) then asks the participant for the status of each
 `unknown` instruction, with backoff and jitter, and resolves it from the answer: a `late`
-instruction that timed out ends `settled` by itself. There is no limit on attempts yet, and
-there is still no projection. The full plan is in
+instruction that timed out ends `settled` by itself. After `RECONCILE_MAX_ATTEMPTS` queries
+without a conclusion it gives up and the instruction becomes `failed` (session 15), and there is
+still no projection. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Up and running in five minutes
@@ -149,6 +150,14 @@ A loop inside the processor works the `reconciliation_tasks` queue.
 - **Backoff with jitter.** The wait doubles on each attempt from `RECONCILE_BACKOFF_BASE` up to
   `RECONCILE_BACKOFF_MAX`; half of it is fixed and half is random, so tasks that failed together
   do not query together and the wait never falls near zero.
+- **Giving up.** The `RECONCILE_MAX_ATTEMPTS`-th query without a conclusion appends
+  `StatusQueried{unknown}` + `ReconciliationExhausted{attempts}` in one transaction and deletes the
+  task: the instruction becomes `failed`. `failed` means "gave up, a human must look", NOT "not
+  processed", so nothing is resent. A conclusive answer on the last attempt still wins.
+- **The cruel case is a test.** The participant processes a `late` instruction but answers after
+  the client timed out: the instruction goes `unknown`, reconciliation queries and finds it
+  processed, and it ends `settled` with the participant's `received` still 1
+  (`cmd/processor/cruel_test.go`).
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -160,6 +169,7 @@ A loop inside the processor works the `reconciliation_tasks` queue.
 | `RECONCILE_POLL` | `1s` | wait between empty rounds |
 | `RECONCILE_LEASE` | `30s` | how long a claimed task stays out of the queue |
 | `RECONCILE_BACKOFF_BASE`, `RECONCILE_BACKOFF_MAX` | `5s`, `1m` | wait between status queries: doubles from the base, capped at the max |
+| `RECONCILE_MAX_ATTEMPTS` | `10` | status queries without a conclusion before giving up (`failed`) |
 | `KAFKA_GROUP` | `payrouter-processor` | consumer group |
 
 ## Development
@@ -226,8 +236,8 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 
 ## Known limitations (v1)
 
-- An `unknown` instruction that the participant never recognizes (for example `drop`) is queried
-  forever, with growing waits: there is no `ReconciliationExhausted` yet (session 15).
+- An instruction the participant never recognizes (for example `drop`) ends `failed` after the
+  attempt limit, with no alert or escalation: someone has to look at `failed` instructions.
 - The reconciliation queries one task at a time, so a large batch of slow queries can outlast the
   lease and a task may be queried twice. Queries are safe and the write is guarded by the version.
 - An instruction can still stay `in_flight` forever if the processor dies between claiming and

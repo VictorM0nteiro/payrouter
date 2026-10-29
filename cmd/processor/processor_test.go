@@ -448,7 +448,7 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 	uc := app.NewProcessInstruction(postgres.NewUnitOfWork(testPool), client, 200*time.Millisecond)
 	reconciler := app.NewReconcile(postgres.NewUnitOfWork(testPool), client, app.ReconcileConfig{
 		Batch: 10, Lease: 30 * time.Second, Poll: 100 * time.Millisecond,
-		BackoffBase: 200 * time.Millisecond, BackoffMax: time.Second,
+		BackoffBase: 200 * time.Millisecond, BackoffMax: time.Second, MaxAttempts: 3,
 	})
 	reconcilerDone := make(chan error, 1)
 	go func() { reconcilerDone <- reconciler.Run(ctx) }()
@@ -466,10 +466,9 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 	// late: o envio deu timeout (unknown) e a conciliação descobriu, pela consulta, que o
 	// participante tinha processado. Resolve sozinho, sem reenviar.
 	waitStatus(t, ids["late"], domain.StatusSettled)
-	// drop: o participante nunca processou e a consulta não acha nada. Segue unknown, e a
-	// conciliação continua tentando, com intervalos crescentes.
-	waitStatus(t, ids["drop"], domain.StatusUnknown)
-	waitFor(t, "2 consultas do drop", func() bool { _, attempts, _ := tasks(t, ids["drop"]); return attempts >= 2 })
+	// drop: o participante nunca processou e a consulta não acha nada. A conciliação tenta
+	// MaxAttempts vezes, com intervalos crescentes, e desiste: failed, sem reenviar.
+	waitStatus(t, ids["drop"], domain.StatusFailed)
 
 	// O late processou no participante, o cliente desistiu, e nada foi reenviado.
 	time.Sleep(2 * time.Second) // passa o LateDelay e uma janela para um reenvio indevido aparecer
@@ -477,13 +476,9 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 		if got := participantReceived(t, srv.URL, id); got != 1 {
 			t.Errorf("%s: o participante recebeu %d vezes, esperado exatamente 1", name, got)
 		}
-		// Só quem segue unknown tem tarefa de conciliação.
-		want := 0
-		if name == "drop" {
-			want = 1
-		}
-		if n, _, _ := tasks(t, id); n != want {
-			t.Errorf("%s: tarefas = %d, esperado %d", name, n, want)
+		// Resolvida ou esgotada, nenhuma instrução deixa tarefa na fila.
+		if n, _, _ := tasks(t, id); n != 0 {
+			t.Errorf("%s: tarefas = %d, esperado 0", name, n)
 		}
 	}
 
@@ -497,18 +492,6 @@ func TestPontaAPontaPeloKafka(t *testing.T) {
 	if err := <-reconcilerDone; err != nil {
 		t.Errorf("reconciler: %v", err)
 	}
-}
-
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("timeout esperando: %s", what)
 }
 
 func waitStatus(t *testing.T, id domain.InstructionID, want domain.Status) {

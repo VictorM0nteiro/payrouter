@@ -119,7 +119,7 @@ func run() error {
 	slog.Info("processor iniciado", "brokers", brokers, "group", group, "participant", participantURL,
 		"participant_timeout", payTimeout.String(), "reconcile_first_delay", firstDelay.String(),
 		"reconcile_poll", reconcile.Poll.String(), "reconcile_backoff_base", reconcile.BackoffBase.String(),
-		"reconcile_backoff_max", reconcile.BackoffMax.String(), "reconcile_max_attempts", reconcile.MaxAttempts )
+		"reconcile_backoff_max", reconcile.BackoffMax.String(), "reconcile_max_attempts", reconcile.MaxAttempts)
 
 	// A conciliação roda ao lado do consumidor; os dois param com o mesmo sinal.
 	var wg sync.WaitGroup

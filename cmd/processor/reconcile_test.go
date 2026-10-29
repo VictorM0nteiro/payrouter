@@ -3,7 +3,8 @@
 // Objetivo: provar a sessão 14. Uma instrução em unknown é resolvida pela RESPOSTA do
 // participante à consulta de status (accepted ou rejected), registrando a consulta e o
 // desfecho juntos e retirando a tarefa; uma consulta sem conclusão (not_found, falha) deixa a
-// instrução em unknown e reagenda a tarefa mais tarde; e nada é reenviado em nenhum caso.
+// instrução em unknown e reagenda a tarefa mais tarde; na última tentativa sem conclusão a
+// instrução desiste (failed); e nada é reenviado em nenhum caso.
 
 package main
 
@@ -36,7 +37,7 @@ func unknownDue(t *testing.T, e2e string) domain.InstructionID {
 func reconciler(p app.Participant) *app.Reconcile {
 	return app.NewReconcile(postgres.NewUnitOfWork(testPool), p, app.ReconcileConfig{
 		Batch: 10, Lease: 30 * time.Second, Poll: 10 * time.Millisecond,
-		BackoffBase: 2 * time.Second, BackoffMax: 10 * time.Second,
+		BackoffBase: 2 * time.Second, BackoffMax: 10 * time.Second, MaxAttempts: 5,
 	})
 }
 
@@ -192,5 +193,85 @@ func TestInstrucaoJaResolvidaApenasRetiraATarefa(t *testing.T) {
 	}
 	if fake.statusCalls.Load() != 0 {
 		t.Errorf("consultas = %d, esperado 0", fake.statusCalls.Load())
+	}
+}
+
+// setAttempts simula tentativas já feitas, sem esperar o backoff.
+func setAttempts(t *testing.T, id domain.InstructionID, n int) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE reconciliation_tasks SET attempts = $2 WHERE aggregate_id = $1::uuid`, string(id), n); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUltimaTentativaSemConclusaoDesisteEViraFailed(t *testing.T) {
+	requireInfra(t)
+	tests := []struct {
+		name string
+		fake *fakeParticipant
+	}{
+		{"not_found", &fakeParticipant{statusResult: app.PaymentResult{Status: app.PaymentNotFound}}},
+		{"consulta_falhou", &fakeParticipant{statusErr: errors.New("timeout")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			id := unknownDue(t, "rc-5-"+tc.name)
+			setAttempts(t, id, 4) // a próxima consulta é a 5ª, a última (MaxAttempts = 5)
+
+			if _, err := reconciler(tc.fake).RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			if p := load(t, id); p.Status() != domain.StatusFailed {
+				t.Errorf("status = %s, esperado failed", p.Status())
+			}
+			want := "InstructionAccepted,RoutingAttempted,RoutingTimedOut,StatusQueried,ReconciliationExhausted"
+			if got := join(eventTypes(t, id)); got != want {
+				t.Errorf("eventos = %s, esperado %s", got, want)
+			}
+			if got := lastPayload(t, id); got != `{"attempts": 5}` {
+				t.Errorf("payload da desistência = %s", got)
+			}
+			if n, _, _ := tasks(t, id); n != 0 {
+				t.Errorf("tarefas = %d, esperado 0: failed não tem mais o que consultar", n)
+			}
+			if tc.fake.calls.Load() != 0 {
+				t.Errorf("envios = %d, esperado 0: desistir nunca reenvia", tc.fake.calls.Load())
+			}
+		})
+	}
+}
+
+func TestAntesDaUltimaTentativaAindaReagenda(t *testing.T) {
+	requireInfra(t)
+	id := unknownDue(t, "rc-6")
+	setAttempts(t, id, 3) // a próxima é a 4ª de 5
+
+	fake := &fakeParticipant{statusResult: app.PaymentResult{Status: app.PaymentNotFound}}
+	if _, err := reconciler(fake).RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if p := load(t, id); p.Status() != domain.StatusUnknown {
+		t.Errorf("status = %s, esperado unknown", p.Status())
+	}
+	if n, attempts, _ := tasks(t, id); n != 1 || attempts != 4 {
+		t.Errorf("tarefas=%d tentativas=%d; esperado 1 e 4", n, attempts)
+	}
+}
+
+func TestRespostaConclusivaNaUltimaTentativaVenceADesistencia(t *testing.T) {
+	requireInfra(t)
+	id := unknownDue(t, "rc-7")
+	setAttempts(t, id, 4)
+
+	fake := &fakeParticipant{statusResult: app.PaymentResult{Status: app.PaymentAccepted}}
+	if _, err := reconciler(fake).RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if p := load(t, id); p.Status() != domain.StatusSettled {
+		t.Errorf("status = %s, esperado settled", p.Status())
 	}
 }
