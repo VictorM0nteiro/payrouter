@@ -22,6 +22,7 @@ import (
 	"github.com/VictorM0nteiro/payrouter/internal/adapters/postgres"
 	"github.com/VictorM0nteiro/payrouter/internal/app"
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 	sim "github.com/VictorM0nteiro/payrouter/internal/participant"
 	"github.com/VictorM0nteiro/payrouter/internal/ratelimit"
 )
@@ -73,6 +74,12 @@ func TestLimiteCheioNaoGravaNadaENaoEnvia(t *testing.T) {
 // pipeline sobe relay, consumidor e conciliação para as instruções dadas e devolve quem encerra.
 func pipeline(t *testing.T, participantURL string, ids []domain.InstructionID, limiter app.Limiter) (stop func()) {
 	t.Helper()
+	return pipelineWith(t, participantURL, ids, limiter, nil)
+}
+
+// pipelineWith é o pipeline com as métricas do processor ligadas (pm nulo = sem métricas).
+func pipelineWith(t *testing.T, participantURL string, ids []domain.InstructionID, limiter app.Limiter, pm *metrics.Processor) (stop func()) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	ours := make(map[string]bool)
 	for _, id := range ids {
@@ -91,15 +98,16 @@ func pipeline(t *testing.T, participantURL string, ids []domain.InstructionID, l
 	if err != nil {
 		t.Fatal(err)
 	}
+	consumer.WithMetrics(pm)
 	client := pclient.NewClient(participantURL, 2*time.Second)
-	uc := app.NewProcessInstruction(postgres.NewUnitOfWork(testPool), client, 200*time.Millisecond)
+	uc := app.NewProcessInstruction(postgres.NewUnitOfWork(testPool), client, 200*time.Millisecond).WithMetrics(pm)
 	if limiter != nil {
 		uc.WithLimiter(limiter)
 	}
 	reconciler := app.NewReconcile(postgres.NewUnitOfWork(testPool), client, app.ReconcileConfig{
 		Batch: 10, Lease: 30 * time.Second, Poll: 100 * time.Millisecond,
 		BackoffBase: 200 * time.Millisecond, BackoffMax: time.Second, MaxAttempts: 3,
-	})
+	}).WithMetrics(pm)
 	reconcilerDone := make(chan error, 1)
 	go func() { reconcilerDone <- reconciler.Run(ctx) }()
 	handle := func(ctx context.Context, m app.Message) error {
