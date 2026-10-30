@@ -31,6 +31,10 @@ const (
 	Late Behavior = "late"
 	// Crash derruba o processo antes de processar. Quem reinicia é o orquestrador.
 	Crash Behavior = "crash"
+	// Throttle responde 429 na primeira chegada da instrução, sem processar nada, e se comporta
+	// como Accept nas seguintes. É o "ainda não processado" que torna reenviar seguro, o oposto de
+	// um timeout, provocável sem depender de tempo.
+	Throttle Behavior = "throttle"
 )
 
 // All lista os comportamentos conhecidos, na ordem em que a documentação os apresenta.

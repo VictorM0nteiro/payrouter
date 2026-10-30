@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,11 @@ func (c *Client) Pay(ctx context.Context, req app.PaymentRequest) (app.PaymentRe
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	// 429 é a única recusa que prova "não processado": reenviar é seguro. Qualquer outro
+	// não-200 continua sendo resultado desconhecido.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return app.PaymentResult{}, &app.ThrottledError{RetryAfter: retryAfter(resp)}
+	}
 	return decode(resp)
 }
 
@@ -115,4 +121,13 @@ func decode(resp *http.Response) (app.PaymentResult, error) {
 	default:
 		return app.PaymentResult{}, fmt.Errorf("%w: status %q desconhecido", app.ErrOutcomeUnknown, out.Status)
 	}
+}
+
+// retryAfter lê o Retry-After em segundos; ausente ou em outro formato vale 0.
+func retryAfter(resp *http.Response) time.Duration {
+	secs, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || secs < 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }

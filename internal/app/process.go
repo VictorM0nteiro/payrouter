@@ -31,6 +31,11 @@ const (
 // reenviar pode cobrar duas vezes. Não confundir com um 429, que é "não processado".
 var ErrOutcomeUnknown = errors.New("resultado do envio desconhecido")
 
+// ErrThrottled: o participante respondeu 429. É "definitivamente NÃO processado", o oposto de
+// ErrOutcomeUnknown: reenviar é seguro. Nunca é embrulhado com ErrOutcomeUnknown. O erro concreto
+// é *ThrottledError, que carrega o Retry-After.
+var ErrThrottled = errors.New("participante respondeu 429: não processado")
+
 // PaymentStatus é a decisão do participante sobre uma instrução.
 type PaymentStatus string
 
@@ -84,6 +89,15 @@ type ProcessInstruction struct {
 	firstDelay  time.Duration // espera até a primeira consulta de conciliação
 }
 
+// ThrottledError é o 429 com o tempo que o participante pediu para esperar (0 se não pediu).
+type ThrottledError struct{ RetryAfter time.Duration }
+
+func (e *ThrottledError) Error() string {
+	return fmt.Sprintf("%v (retry-after %s)", ErrThrottled, e.RetryAfter)
+}
+
+func (e *ThrottledError) Unwrap() error { return ErrThrottled }
+
 func NewProcessInstruction(uow UnitOfWork, participant Participant, firstDelay time.Duration) *ProcessInstruction {
 	return &ProcessInstruction{uow: uow, participant: participant, firstDelay: firstDelay}
 }
@@ -94,7 +108,7 @@ func NewProcessInstruction(uow UnitOfWork, participant Participant, firstDelay t
 // só se nem o unknown pôde ser gravado: o chamador NÃO deve repetir a mensagem. Qualquer
 // outro erro é transitório e a mensagem pode ser repetida.
 func (uc *ProcessInstruction) Handle(ctx context.Context, msg Message) error {
-	if msg.EventType != string(domain.EventInstructionAccepted) {
+	if msg.EventType != string(domain.EventInstructionAccepted) && msg.EventType != string(domain.EventRoutingThrottled) {
 		return nil
 	}
 	id := domain.InstructionID(msg.AggregateID)
@@ -151,6 +165,10 @@ func (uc *ProcessInstruction) Handle(ctx context.Context, msg Message) error {
 
 	// O efeito colateral. Daqui em diante um erro nunca autoriza reenviar.
 	result, err := uc.participant.Pay(ctx, request)
+	var throttled *ThrottledError
+	if errors.As(err, &throttled) {
+		return uc.recordThrottle(ctx, p, throttled)
+	}
 	if err != nil {
 		return uc.recordUnknown(ctx, p, asUnknown(err))
 	}
@@ -250,4 +268,29 @@ func asUnknown(err error) error {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrOutcomeUnknown, err)
+}
+
+// recordThrottle grava o 429: RoutingThrottled devolve a instrução a accepted. Nada foi
+// processado, então a mensagem que esse evento gera no outbox a reenvia. Antes de devolver,
+// espera o Retry-After pedido (limitado), porque o handler em andamento segura a partição: é a
+// contrapressão sobre um participante que mandou ir mais devagar.
+func (uc *ProcessInstruction) recordThrottle(ctx context.Context, p *domain.PaymentInstruction, cause *ThrottledError) error {
+	expected := p.Version()
+	event, err := p.Throttle()
+	if err != nil {
+		return fmt.Errorf("instrução %s: %w", p.ID(), err)
+	}
+	err = uc.commit(ctx, p.ID(), expected, event, nil)
+	switch {
+	case err == nil:
+		slog.WarnContext(ctx, "processor: participante deu 429, a instrução será reenviada",
+			"instruction_id", string(p.ID()), "retry_after", cause.RetryAfter.String())
+		sleep(ctx, min(cause.RetryAfter, maxThrottlePause))
+		return nil
+	case errors.Is(err, ErrConcurrencyConflict):
+		slog.InfoContext(ctx, "processor: instrução já resolvida por outro caminho", "instruction_id", string(p.ID()))
+		return nil
+	}
+	// A instrução fica em in_flight e a mensagem não será repetida (já foi reivindicada).
+	return fmt.Errorf("instrução %s: 429 não gravado: %w: %w", p.ID(), ErrOutcomeUnknown, err)
 }
