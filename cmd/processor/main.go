@@ -88,9 +88,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	outputBurst, err := intFromEnv("OUTPUT_BURST", 0)
-	if err != nil {
-		return err
+	// OUTPUT_BURST=0 (o que o compose passa quando ninguém define) vale "sem rajada explícita",
+	// como na API e no participante; só um valor negativo ou não numérico é erro.
+	outputBurst := 0
+	if os.Getenv("OUTPUT_BURST") != "0" {
+		if outputBurst, err = intFromEnv("OUTPUT_BURST", 0); err != nil {
+			return err
+		}
 	}
 	group := os.Getenv("KAFKA_GROUP")
 	if group == "" {
