@@ -408,7 +408,7 @@ func TestAgregadoInexistenteEErroTransitorio(t *testing.T) {
 	}
 }
 
-// TestPontaAPontaDosSeisComportamentos percorre o caminho inteiro com os sete comportamentos do
+// TestPontaAPontaDosComportamentos percorre o caminho inteiro com os sete comportamentos do
 // participante ao mesmo tempo: evento + outbox no Postgres, relay, Redpanda, consumidor, caso de
 // uso, participante simulado de verdade (HTTP) e conciliação. Para cada um confere o desfecho e a
 // trilha EXATA de eventos, e que o participante recebeu a instrução uma vez só (nada é reenviado).

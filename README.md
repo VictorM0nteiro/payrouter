@@ -46,8 +46,11 @@ Phase D). The reconciliation loop (session 14) then asks the participant for the
 `unknown` instruction, with backoff and jitter, and resolves it from the answer: a `late`
 instruction that timed out ends `settled` by itself. After `RECONCILE_MAX_ATTEMPTS` queries
 without a conclusion it gives up and the instruction becomes `failed` (session 15). One
-end-to-end test runs all six participant behaviors through the whole pipeline (session 16), and
-there is still no projection. The full plan is in
+end-to-end test runs all the participant behaviors through the whole pipeline (session 16). A
+`429` from the participant is the opposite of a timeout: definitely not processed, so the
+instruction returns to `accepted` and is resent; an output rate limit with backpressure keeps it
+from happening, and a per-client input limit protects the API (session 17). There is still no
+projection. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Up and running in five minutes
@@ -106,8 +109,14 @@ many times each instruction arrived (`received`).
 | `drop` | no | never answers; the status query finds nothing |
 | `late` | yes, at once | `accepted` only after `LATE_DELAY` (10 s), when the client already gave up: the cruel case |
 | `crash` | no | the process exits; compose restarts it |
+| `throttle` | no, on the first arrival | `429` with `Retry-After: 1`; from the second arrival on it behaves as `accept` |
 
-What the processor does with each one is pinned by `TestPontaAPontaDosSeisComportamentos`
+The participant can also enforce a real rate limit: with `PARTICIPANT_TPS` above 0, arrivals over
+that rate (with a burst of `PARTICIPANT_BURST`, default `ceil(TPS)`) get `429` and are NOT
+processed. `GET /payments/{id}` reports `received` (arrivals that were admitted) and `throttled`
+(arrivals refused with `429`), so `received == 1` stays the proof that nothing was sent twice.
+
+What the processor does with each one is pinned by `TestPontaAPontaDosComportamentos`
 (`cmd/processor`), which checks the exact event trail and that the participant received the
 instruction once:
 
@@ -115,6 +124,7 @@ instruction once:
 |---|---|---|
 | `accept`, `slow` | `settled` (`slow` never becomes `unknown`) | `RoutingAttempted`, `ParticipantAccepted` |
 | `reject` | `rejected` | `RoutingAttempted`, `ParticipantRejected` |
+| `throttle` | `settled` after a resend | `RoutingAttempted`, `RoutingThrottled`, `RoutingAttempted`, `ParticipantAccepted` |
 | `late` | `settled` via status query | `RoutingAttempted`, `RoutingTimedOut`, `StatusQueried`, `ParticipantAccepted` |
 | `drop`, `crash` | `failed` | `RoutingAttempted`, `RoutingTimedOut`, `StatusQueried` x N, `ReconciliationExhausted` |
 
@@ -132,7 +142,7 @@ curl -s localhost:9090/payments/x1   # {"status":"accepted","received":1}
 
 ## The processor
 
-`processor` consumes `InstructionAccepted` from Kafka, sends the instruction to the participant
+`processor` consumes `InstructionAccepted` (and `RoutingThrottled`) from Kafka, sends the instruction to the participant
 and records the answer. It is where the side effect lives (command side, never the projection).
 
 - **Idempotent by the aggregate version, with no deduplication table.** It reloads the
@@ -184,7 +194,36 @@ A loop inside the processor works the `reconciliation_tasks` queue.
 | `RECONCILE_LEASE` | `30s` | how long a claimed task stays out of the queue |
 | `RECONCILE_BACKOFF_BASE`, `RECONCILE_BACKOFF_MAX` | `5s`, `1m` | wait between status queries: doubles from the base, capped at the max |
 | `RECONCILE_MAX_ATTEMPTS` | `10` | status queries without a conclusion before giving up (`failed`) |
+| `OUTPUT_TPS` | `0` (off) | output rate limit toward the participant, in sends per second |
+| `OUTPUT_BURST` | `ceil(OUTPUT_TPS)` | burst allowed above `OUTPUT_TPS` |
 | `KAFKA_GROUP` | `payrouter-processor` | consumer group |
+
+### Rate limits and 429
+
+Two failures that look alike in the log and must never be handled alike:
+
+| Participant answer | What it proves | Reaction |
+|---|---|---|
+| `429` | definitely NOT processed | `RoutingThrottled` returns the instruction to `accepted` and the message of that event resends it |
+| timeout, `5xx`, unreadable | I don't know | `unknown`, a reconciliation task, and only a status query: never a resend |
+
+- **A throttled instruction is re-driven through the outbox.** `RoutingThrottled` is appended like
+  any event, the relay publishes it, and the processor handles it exactly as `InstructionAccepted`:
+  it acts only if the instruction is `accepted` at the message's version, so a repeated or stale
+  message is skipped. After recording the `429` the handler waits the participant's `Retry-After`
+  (at most 10 s), which holds the partition: backpressure on a participant that said to slow down.
+  A `429` on a status query tells nothing about the instruction and stays an unknown outcome.
+- **The output limit comes before the claim.** With `OUTPUT_TPS` set, each send reserves a token
+  first. If none is available the use case writes NOTHING (no `RoutingAttempted`, so a crash while
+  waiting leaves no instruction stuck `in_flight`) and asks the consumer to wait. The consumer
+  pauses that partition, waits, resumes it, and repeats the SAME message: the offset does not
+  advance, order is kept, nothing is dropped or piled up in memory. Lag grows, and that is correct:
+  the instruction waits. The limiter is the token bucket from wallet-go, reused (not a
+  contribution of this project).
+- **The input limit protects the API.** With `API_RATE_RPS` set, each authenticated client gets
+  its own bucket on `POST /instructions` and `GET /instructions/{id}`; over the limit it gets
+  `429 rate_limited` with `Retry-After`, and the use case does not run. This `429` (API to
+  client) is unrelated to the participant's `429`.
 
 ## Development
 
@@ -223,6 +262,8 @@ An already issued token is valid until it expires even if the client is deactiva
 | `ADDR` | `:8080` | listen address |
 | `LOG_FORMAT` | `json` | `text` writes human-readable logs to the terminal |
 | `REQUEST_TIMEOUT` | `5s` | deadline of each request, passed on to Postgres through the context |
+| `API_RATE_RPS` | `0` (off) | requests per second allowed per client; over it, `429 rate_limited` |
+| `API_RATE_BURST` | `ceil(API_RATE_RPS)` | burst allowed above `API_RATE_RPS` |
 
 ### Observability and deadlines
 
@@ -257,7 +298,13 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 - An instruction can still stay `in_flight` forever if the processor dies between claiming and
   sending, or if even the `unknown` record cannot be written.
 - There is no dead-letter queue: a message without the expected headers is logged and skipped.
-- The processor handles one message at a time (no worker pool yet).
+- The processor handles one message at a time (no worker pool yet), so a partition waiting on the
+  output limit also delays the others read by the same consumer.
+- The output limiter lets several waiting callers wake together and compete for one token; fine
+  for a sequential consumer, to revisit when the elastic pool processes in parallel.
+- A message the processor skips (repeated or stale) still spends one output token.
+- The input limiter keeps one bucket per client forever (clients are registered by an admin, so
+  the set is small); expire idle buckets if registration is ever opened.
 - The participant keeps its state in memory: a `crash` or restart forgets everything it
   processed.
 - At-least-once delivery: the same event can appear twice in the topic after the relay
