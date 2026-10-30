@@ -75,7 +75,6 @@ func TestConexaoCaidaE5xxECorpoIlegivelViramResultadoDesconhecido(t *testing.T) 
 		handler http.HandlerFunc
 	}{
 		{"http_500", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) }},
-		{"http_429_por_enquanto", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTooManyRequests) }},
 		{"corpo_ilegivel", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("não é json")) }},
 		{"status_desconhecido", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"talvez"}`)) }},
 		{"rejeicao_sem_codigo", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"rejected"}`)) }},

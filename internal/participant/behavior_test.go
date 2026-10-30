@@ -51,7 +51,7 @@ func TestParse(t *testing.T) {
 }
 
 func TestOsSeisComportamentosEstaoRegistrados(t *testing.T) {
-	if len(All) != 6 {
-		t.Errorf("comportamentos = %d, esperado 6: %v", len(All), All)
+	if len(All) != 7 {
+		t.Errorf("comportamentos = %d, esperado 7: %v", len(All), All)
 	}
 }

@@ -408,14 +408,14 @@ func TestAgregadoInexistenteEErroTransitorio(t *testing.T) {
 	}
 }
 
-// TestPontaAPontaDosSeisComportamentos percorre o caminho inteiro com os seis comportamentos do
+// TestPontaAPontaDosSeisComportamentos percorre o caminho inteiro com os sete comportamentos do
 // participante ao mesmo tempo: evento + outbox no Postgres, relay, Redpanda, consumidor, caso de
 // uso, participante simulado de verdade (HTTP) e conciliação. Para cada um confere o desfecho e a
 // trilha EXATA de eventos, e que o participante recebeu a instrução uma vez só (nada é reenviado).
 // O que os seis provam juntos: o processor não confunde os casos. Resposta lenta que ainda cabe
 // no prazo não é unknown; resposta tardia é unknown que a conciliação liquida; mensagem perdida e
 // queda do participante são indistinguíveis para ele (unknown e depois failed).
-func TestPontaAPontaDosSeisComportamentos(t *testing.T) {
+func TestPontaAPontaDosComportamentos(t *testing.T) {
 	requireInfra(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -440,6 +440,9 @@ func TestPontaAPontaDosSeisComportamentos(t *testing.T) {
 		{"slow", domain.StatusSettled, "RoutingAttempted,ParticipantAccepted"},
 		{"late", domain.StatusSettled, "RoutingAttempted,RoutingTimedOut,StatusQueried,ParticipantAccepted"},
 		{"drop", domain.StatusFailed, "RoutingAttempted,RoutingTimedOut" + consulta + ",ReconciliationExhausted"},
+		// throttle: o 429 prova "não processado". A instrução volta a accepted e é reenviada pela
+		// mensagem do RoutingThrottled; o participante só conta a chegada admitida (received = 1).
+		{"throttle", domain.StatusSettled, "RoutingAttempted,RoutingThrottled,RoutingAttempted,ParticipantAccepted"},
 		{"crash", domain.StatusFailed, "RoutingAttempted,RoutingTimedOut" + consulta + ",ReconciliationExhausted"},
 	}
 	ids := make(map[string]domain.InstructionID)
