@@ -13,6 +13,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/redpanda v0.44.0
 	github.com/twmb/franz-go/pkg/kadm v1.18.0
+	golang.org/x/time v0.15.0
 )
 
 require (

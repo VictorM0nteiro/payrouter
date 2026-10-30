@@ -36,6 +36,7 @@ type handler struct {
 	accept acceptor
 	get    getter
 	authn  authenticator
+	limits *clientLimiter // limite de entrada por cliente; nil = sem limite
 }
 
 // readyTimeout é o prazo do ping do /readyz: uma sonda lenta conta como indisponível.
@@ -76,12 +77,15 @@ func wrap(next http.Handler, requestTimeout time.Duration) http.Handler {
 }
 
 // NewHandler devolve o http.Handler da API.
-func NewHandler(accept acceptor, get getter, authn authenticator, verifier app.TokenVerifier) http.Handler {
+func NewHandler(accept acceptor, get getter, authn authenticator, verifier app.TokenVerifier, opts ...Option) http.Handler {
 	h := &handler{accept: accept, get: get, authn: authn}
+	for _, opt := range opts {
+		opt(h)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /auth/token", h.postToken)
-	mux.HandleFunc("POST /instructions", authenticate(verifier, h.postInstruction))
-	mux.HandleFunc("GET /instructions/{id}", authenticate(verifier, h.getInstruction))
+	mux.HandleFunc("POST /instructions", authenticate(verifier, limit(h.limits, h.postInstruction)))
+	mux.HandleFunc("GET /instructions/{id}", authenticate(verifier, limit(h.limits, h.getInstruction)))
 	return mux
 }

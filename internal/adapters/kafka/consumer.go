@@ -6,7 +6,9 @@
 // lugar, sem pular para a próxima (preserva a ordem por partição e aplica contrapressão). A
 // única exceção é app.ErrOutcomeUnknown, que é uma resposta definitiva do handler: o envio
 // já foi feito e reenviar é perigoso, então o offset avança. Mensagem sem os headers
-// esperados (veneno) é registrada e pulada, porque repeti-la não a conserta.
+// esperados (veneno) é registrada e pulada, porque repeti-la não a conserta. Quando o limite de
+// saída está cheio (app.BackpressureError), pausa a partição do registro, espera e a retoma, e
+// repete a mesma mensagem: contrapressão, o lag cresce, nada é descartado nem acumulado em memória.
 
 package kafka
 
@@ -113,6 +115,13 @@ func (c *Consumer) process(ctx context.Context, handle Handler, r *kgo.Record) b
 			slog.WarnContext(ctx, "consumer: resultado desconhecido, não será reenviado", "instruction_id", msg.AggregateID, "error", err)
 			return true
 		}
+		var bp *app.BackpressureError
+		if errors.As(err, &bp) {
+			if !c.pauseAndWait(ctx, r, bp.After) {
+				return false
+			}
+			continue
+		}
 		slog.ErrorContext(ctx, "consumer: erro transitório, repetindo a mensagem", "instruction_id", msg.AggregateID,
 			"error", err, "retry_in", backoff.String())
 		select {
@@ -121,6 +130,21 @@ func (c *Consumer) process(ctx context.Context, handle Handler, r *kgo.Record) b
 		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, maxRetryBackoff)
+	}
+}
+
+// pauseAndWait pausa a partição do registro, espera d e a retoma. Devolve false se o contexto
+// terminou antes; a partição é retomada de qualquer forma, para nunca ficar pausada.
+func (c *Consumer) pauseAndWait(ctx context.Context, r *kgo.Record, d time.Duration) bool {
+	parts := map[string][]int32{r.Topic: {r.Partition}}
+	c.client.PauseFetchPartitions(parts)
+	defer c.client.ResumeFetchPartitions(parts)
+	slog.DebugContext(ctx, "consumer: limite de saída cheio, partição pausada", "partition", r.Partition, "wait", d.String())
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
 	}
 }
 

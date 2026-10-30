@@ -1,5 +1,5 @@
 // behavior.go
-// Os seis comportamentos do participante simulado e a regra que escolhe um deles para cada
+// Os comportamentos do participante simulado e a regra que escolhe um deles para cada
 // instrução.
 // Objetivo: tornar o estado desconhecido reproduzível sob demanda. Um prefixo no
 // end_to_end_id ("late:abc") força o comportamento daquela instrução; sem prefixo, vale o
@@ -38,7 +38,7 @@ const (
 )
 
 // All lista os comportamentos conhecidos, na ordem em que a documentação os apresenta.
-var All = []Behavior{Accept, Reject, Slow, Drop, Late, Crash}
+var All = []Behavior{Accept, Reject, Slow, Drop, Late, Crash, Throttle}
 
 // Parse reconhece o nome de um comportamento, sem diferenciar maiúsculas de minúsculas.
 func Parse(s string) (Behavior, error) {

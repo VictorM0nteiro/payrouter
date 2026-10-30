@@ -46,6 +46,8 @@ services:
       # Vem do .env (veja `make env`). Sem ele o compose recusa subir, em vez de usar um
       # segredo conhecido.
       JWT_SECRET: "${JWT_SECRET:?JWT_SECRET ausente, rode make env}"
+      API_RATE_RPS: ${API_RATE_RPS:-0}
+      API_RATE_BURST: ${API_RATE_BURST:-0}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     ports:
       - "8080:8080"
@@ -128,6 +130,8 @@ services:
       RECONCILE_BACKOFF_BASE: ${RECONCILE_BACKOFF_BASE:-5s}
       RECONCILE_BACKOFF_MAX: ${RECONCILE_BACKOFF_MAX:-1m}
       RECONCILE_MAX_ATTEMPTS: ${RECONCILE_MAX_ATTEMPTS:-10}
+      OUTPUT_TPS: ${OUTPUT_TPS:-0}
+      OUTPUT_BURST: ${OUTPUT_BURST:-0}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     restart: unless-stopped
     # Termina a mensagem em andamento ao receber SIGTERM; o envio tem prazo próprio.
@@ -141,6 +145,8 @@ services:
     entrypoint: ["participant"]
     environment:
       PARTICIPANT_BEHAVIOR: ${PARTICIPANT_BEHAVIOR:-accept}
+      PARTICIPANT_TPS: ${PARTICIPANT_TPS:-0}
+      PARTICIPANT_BURST: ${PARTICIPANT_BURST:-0}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     ports:
       - "9090:9090"

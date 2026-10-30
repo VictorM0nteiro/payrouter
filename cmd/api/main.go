@@ -1,6 +1,6 @@
 // main.go
 // Ponto de entrada do processo api: lê a configuração do ambiente (DATABASE_URL, JWT_SECRET,
-// ADDR, LOG_FORMAT, REQUEST_TIMEOUT), liga as peças e sobe o servidor HTTP.
+// ADDR, LOG_FORMAT, REQUEST_TIMEOUT, API_RATE_RPS, API_RATE_BURST), liga as peças e sobe o servidor HTTP.
 // Objetivo: ser a única "composition root" da API. É aqui, e só aqui, que o Postgres, os
 // casos de uso e o adapter HTTP se encontram, e onde todos os prazos ficam explícitos:
 // nenhum valor padrão do net/http ou do pgx decide por nós. Também desliga com elegância:
@@ -14,10 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -86,6 +88,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	rateRPS, err := floatFromEnv("API_RATE_RPS", 0)
+	if err != nil {
+		return err
+	}
+	rateBurst, err := intFromEnv("API_RATE_BURST", 0)
+	if err != nil {
+		return err
+	}
+	if rateBurst == 0 {
+		// Sem API_RATE_BURST, a rajada é de uma requisição por RPS (no mínimo 1).
+		rateBurst = max(1, int(math.Ceil(rateRPS)))
+	}
 
 	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -110,7 +124,7 @@ func run() error {
 	})
 	get := app.NewGetInstruction(postgres.NewEventStore(pool))
 	authn := app.NewAuthenticateClient(postgres.NewClientStore(pool), signer)
-	api := httpapi.NewHandler(accept, get, authn, signer)
+	api := httpapi.NewHandler(accept, get, authn, signer, httpapi.WithRateLimit(rateRPS, rateBurst))
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -166,6 +180,33 @@ func serve(ctx context.Context, srv *http.Server, ln net.Listener, shutdownTimeo
 	}
 	slog.Info("api encerrada")
 	return nil
+}
+
+// floatFromEnv lê um número não negativo da variável, ou devolve def se ela estiver vazia. Zero
+// desliga o limite.
+func floatFromEnv(name string, def float64) (float64, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil || f < 0 {
+		return 0, fmt.Errorf("%s: %q não é um número não negativo", name, raw)
+	}
+	return f, nil
+}
+
+// intFromEnv lê um inteiro não negativo da variável, ou devolve def se ela estiver vazia.
+func intFromEnv(name string, def int) (int, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s: %q não é um inteiro não negativo", name, raw)
+	}
+	return n, nil
 }
 
 // durationFromEnv lê uma duração (ex.: "5s") da variável, ou devolve def se ela estiver vazia.

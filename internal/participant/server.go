@@ -13,10 +13,13 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/VictorM0nteiro/payrouter/internal/ratelimit"
 )
 
 const (
@@ -35,6 +38,8 @@ type Config struct {
 	LateDelay  time.Duration // atraso do Late
 	RejectCode string        // código devolvido pelo Reject
 	Exit       func(int)     // como o Crash derruba o processo; padrão os.Exit, injetável nos testes
+	TPS        float64       // limite de instruções por segundo; 0 = sem limite. Acima dele, 429
+	Burst      int           // rajada tolerada acima do TPS; padrão = ceil(TPS)
 }
 
 // Request é a instrução recebida. O valor é sempre int64 de centavos.
@@ -54,9 +59,10 @@ type result struct {
 
 // statusBody é o corpo do GET /payments/{id}.
 type statusBody struct {
-	Status   string `json:"status"`
-	Code     string `json:"code,omitempty"`
-	Received int    `json:"received"`
+	Status    string `json:"status"`
+	Code      string `json:"code,omitempty"`
+	Received  int    `json:"received"`
+	Throttled int    `json:"throttled"`
 }
 
 // Server implementa http.Handler.
@@ -66,6 +72,8 @@ type Server struct {
 	mu        sync.Mutex
 	processed map[string]result // instruções efetivamente processadas, por instruction_id
 	received  map[string]int    // quantas vezes cada instrução chegou, processada ou não
+	throttled map[string]int    // quantas vezes cada instrução levou 429 (não chegou a ser processada)
+	bucket    *ratelimit.Bucket // limite de taxa real; nil = sem limite
 }
 
 func New(cfg Config) *Server {
@@ -89,6 +97,14 @@ func New(cfg Config) *Server {
 		mux:       http.NewServeMux(),
 		processed: make(map[string]result),
 		received:  make(map[string]int),
+		throttled: make(map[string]int),
+	}
+	if cfg.TPS > 0 {
+		burst := cfg.Burst
+		if burst <= 0 {
+			burst = int(math.Ceil(cfg.TPS))
+		}
+		s.bucket = ratelimit.New(cfg.TPS, burst)
 	}
 	s.mux.HandleFunc("POST /payments", s.handlePay)
 	s.mux.HandleFunc("GET /payments/{id}", s.handleStatus)
@@ -115,6 +131,13 @@ func (s *Server) handlePay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	behavior := Resolve(req.EndToEndID, s.cfg.Default)
+	if s.refuse(req.InstructionID, behavior) {
+		// 429: não processou nada e não conta como chegada admitida. Reenviar é seguro.
+		slog.InfoContext(r.Context(), "instrução recusada com 429", "instruction_id", req.InstructionID)
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "limite de taxa excedido, tente depois")
+		return
+	}
 	s.countReceived(req.InstructionID)
 	slog.InfoContext(r.Context(), "instrução recebida", "instruction_id", req.InstructionID, "behavior", string(behavior))
 
@@ -153,13 +176,28 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	res, ok := s.processed[id]
 	received := s.received[id]
+	throttled := s.throttled[id]
 	s.mu.Unlock()
 
 	if !ok {
-		writeJSON(w, http.StatusNotFound, statusBody{Status: "not_found", Received: received})
+		writeJSON(w, http.StatusNotFound, statusBody{Status: "not_found", Received: received, Throttled: throttled})
 		return
 	}
-	writeJSON(w, http.StatusOK, statusBody{Status: res.Status, Code: res.Code, Received: received})
+	writeJSON(w, http.StatusOK, statusBody{Status: res.Status, Code: res.Code, Received: received, Throttled: throttled})
+}
+
+// refuse diz se esta chegada deve levar 429 e, se deve, conta o 429. Recusa quem estourou o
+// limite de taxa real (TPS) e, para o comportamento throttle, a primeira chegada de cada
+// instrução. Quem é recusado não é processado.
+func (s *Server) refuse(id string, b Behavior) bool {
+	limited := s.bucket != nil && s.bucket.Reserve() > 0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !limited && (b != Throttle || s.throttled[id] > 0) {
+		return false
+	}
+	s.throttled[id]++
+	return true
 }
 
 // countReceived registra que a instrução chegou, mesmo que depois seja perdida ou derrube o processo.

@@ -82,6 +82,15 @@ func (c *Client) Pay(ctx context.Context, req app.PaymentRequest) (app.PaymentRe
 	return decode(resp)
 }
 
+// retryAfter lê o Retry-After em segundos; ausente ou em outro formato vale 0.
+func retryAfter(resp *http.Response) time.Duration {
+	secs, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || secs < 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
 // Status consulta GET /payments/{id}. 404 é "o participante não tem registro" (not_found), que
 // não prova que nada foi processado; tudo que não for uma resposta conclusiva é ErrOutcomeUnknown.
 func (c *Client) Status(ctx context.Context, id string) (app.PaymentResult, error) {
@@ -121,13 +130,4 @@ func decode(resp *http.Response) (app.PaymentResult, error) {
 	default:
 		return app.PaymentResult{}, fmt.Errorf("%w: status %q desconhecido", app.ErrOutcomeUnknown, out.Status)
 	}
-}
-
-// retryAfter lê o Retry-After em segundos; ausente ou em outro formato vale 0.
-func retryAfter(resp *http.Response) time.Duration {
-	secs, err := strconv.Atoi(resp.Header.Get("Retry-After"))
-	if err != nil || secs < 0 {
-		return 0
-	}
-	return time.Duration(secs) * time.Second
 }

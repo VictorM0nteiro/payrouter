@@ -1,6 +1,7 @@
 // main.go
 // Ponto de entrada do processo participant: lê a configuração do ambiente (ADDR,
-// PARTICIPANT_BEHAVIOR, SLOW_DELAY, LATE_DELAY, REJECT_CODE, LOG_FORMAT) e sobe o participante
+// PARTICIPANT_BEHAVIOR, SLOW_DELAY, LATE_DELAY, REJECT_CODE, PARTICIPANT_TPS, PARTICIPANT_BURST,
+// LOG_FORMAT) e sobe o participante
 // simulado.
 // Objetivo: dar ao sistema uma contraparte externa configurável, que pode aceitar, rejeitar,
 // demorar, perder a mensagem, responder depois do timeout ou cair. O valor inválido de qualquer
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -62,6 +64,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	tps, err := floatFromEnv("PARTICIPANT_TPS", 0)
+	if err != nil {
+		return err
+	}
+	burst, err := intFromEnv("PARTICIPANT_BURST", 0)
+	if err != nil {
+		return err
+	}
 	addr := os.Getenv("ADDR")
 	if addr == "" {
 		addr = defaultAddr
@@ -72,6 +82,8 @@ func run() error {
 		SlowDelay:  slowDelay,
 		LateDelay:  lateDelay,
 		RejectCode: os.Getenv("REJECT_CODE"),
+		TPS:        tps,
+		Burst:      burst,
 	})
 	srv := &http.Server{
 		Addr:              addr,
@@ -87,7 +99,7 @@ func run() error {
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
 	slog.Info("participante ouvindo", "addr", addr, "behavior", string(behavior),
-		"slow_delay", slowDelay.String(), "late_delay", lateDelay.String())
+		"slow_delay", slowDelay.String(), "late_delay", lateDelay.String(), "tps", tps, "burst", burst)
 
 	select {
 	case err := <-errc:
@@ -120,4 +132,31 @@ func durationFromEnv(name string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %q não é uma duração positiva (ex.: 2s)", name, raw)
 	}
 	return d, nil
+}
+
+// floatFromEnv lê um número não negativo da variável, ou devolve def se ela estiver vazia. Zero
+// desliga o limite.
+func floatFromEnv(name string, def float64) (float64, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil || f < 0 {
+		return 0, fmt.Errorf("%s: %q não é um número não negativo", name, raw)
+	}
+	return f, nil
+}
+
+// intFromEnv lê um inteiro não negativo da variável, ou devolve def se ela estiver vazia.
+func intFromEnv(name string, def int) (int, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s: %q não é um inteiro não negativo", name, raw)
+	}
+	return n, nil
 }

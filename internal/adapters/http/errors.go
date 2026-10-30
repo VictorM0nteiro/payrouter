@@ -34,6 +34,7 @@ type errorMapping struct {
 
 // errorTable mapeia cada erro conhecido. A ordem não importa: os alvos são distintos.
 var errorTable = []errorMapping{
+	{errRateLimited, http.StatusTooManyRequests, "rate_limited", "limite de requisições excedido, tente depois"},
 	{errUnauthorized, http.StatusUnauthorized, "unauthorized", "token ausente, inválido ou expirado"},
 	{app.ErrInvalidCredentials, http.StatusUnauthorized, "invalid_credentials", "client_id ou client_secret inválidos"},
 	{errInvalidJSON, http.StatusBadRequest, "invalid_json", "corpo da requisição não é um JSON válido para este endpoint"},
