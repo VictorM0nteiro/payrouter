@@ -62,7 +62,8 @@ func matches(got []*dto.LabelPair, want map[string]string) bool {
 
 func TestOs429DoProcessorBatemComOsDoParticipanteETudoTerminaSettled(t *testing.T) {
 	requireInfra(t)
-	srv := httptest.NewServer(sim.New(sim.Config{TPS: 3, Burst: 1}))
+	regP := metrics.NewRegistry() // a verdade do lado do participante
+	srv := httptest.NewServer(sim.New(sim.Config{TPS: 3, Burst: 1, Metrics: metrics.NewParticipant(regP)}))
 	defer srv.Close()
 	ids := newBatch(t, "mt-429", 6)
 	reg := metrics.NewRegistry()
@@ -86,6 +87,13 @@ func TestOs429DoProcessorBatemComOsDoParticipanteETudoTerminaSettled(t *testing.
 	}
 	if got := series(t, reg, "payrouter_routing_outcomes_total", map[string]string{"outcome": "settled"}); got != 6 {
 		t.Errorf("settled = %v, esperado 6", got)
+	}
+	// O mesmo número pelas métricas do participante: o que o processor viu é o que aconteceu lá.
+	if got := series(t, regP, "payrouter_participant_throttled_total", nil); int(got) != seenByParticipant {
+		t.Errorf("429 nas métricas do participante = %v, no status = %d; esperado iguais", got, seenByParticipant)
+	}
+	if got := series(t, regP, "payrouter_participant_payments_total", map[string]string{"behavior": "accept", "result": "accepted"}); got != 6 {
+		t.Errorf("aceitas pelo participante = %v, esperado 6 (uma por instrução, apesar dos 429)", got)
 	}
 	if got := series(t, reg, "payrouter_participant_calls_total", map[string]string{"op": "pay", "result": "unknown"}); got != 0 {
 		t.Errorf("pay unknown = %v, esperado 0: 429 nunca vira unknown", got)

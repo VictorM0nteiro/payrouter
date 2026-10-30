@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 	"github.com/VictorM0nteiro/payrouter/internal/ratelimit"
 )
 
@@ -40,6 +41,8 @@ type Config struct {
 	Exit       func(int)     // como o Crash derruba o processo; padrão os.Exit, injetável nos testes
 	TPS        float64       // limite de instruções por segundo; 0 = sem limite. Acima dele, 429
 	Burst      int           // rajada tolerada acima do TPS; padrão = ceil(TPS)
+
+	Metrics *metrics.Participant // nil = sem métricas
 }
 
 // Request é a instrução recebida. O valor é sempre int64 de centavos.
@@ -134,6 +137,7 @@ func (s *Server) handlePay(w http.ResponseWriter, r *http.Request) {
 	if s.refuse(req.InstructionID, behavior) {
 		// 429: não processou nada e não conta como chegada admitida. Reenviar é seguro.
 		slog.InfoContext(r.Context(), "instrução recusada com 429", "instruction_id", req.InstructionID)
+		s.cfg.Metrics.Throttled()
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusTooManyRequests, "rate_limited", "limite de taxa excedido, tente depois")
 		return
@@ -144,11 +148,13 @@ func (s *Server) handlePay(w http.ResponseWriter, r *http.Request) {
 	switch behavior {
 	case Crash:
 		// Cai antes de tocar no estado: a instrução não foi processada.
+		s.cfg.Metrics.Payment(string(behavior), "crashed")
 		s.cfg.Exit(1)
 		return
 	case Drop:
 		// A mensagem se perdeu: nada é gravado e nada é respondido. Segura a conexão até o
 		// cliente desistir (ou o servidor encerrar).
+		s.cfg.Metrics.Payment(string(behavior), "dropped")
 		<-r.Context().Done()
 		return
 	}
@@ -220,6 +226,7 @@ func (s *Server) process(id string, b Behavior) result {
 		res = result{Status: "rejected", Code: s.cfg.RejectCode}
 	}
 	s.processed[id] = res
+	s.cfg.Metrics.Payment(string(b), res.Status) // só na primeira vez: a repetição devolve o guardado acima
 	return res
 }
 

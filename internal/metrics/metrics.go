@@ -14,6 +14,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -261,4 +262,71 @@ func (c *backlogCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.tasks, prometheus.GaugeValue, float64(b.ReconciliationTasks))
 	ch <- prometheus.MustNewConstMetric(c.pending, prometheus.GaugeValue, float64(b.OutboxPending))
 	ch <- prometheus.MustNewConstMetric(c.age, prometheus.GaugeValue, b.OutboxOldestAge)
+}
+
+type HTTP struct {
+	requests *prometheus.CounterVec
+	duration *prometheus.HistogramVec
+}
+
+func NewHTTP(reg *prometheus.Registry) *HTTP {
+	m := &HTTP{
+		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "http_requests_total",
+			Help: "Requisições da API, por rota (o padrão do mux, nunca o caminho) e status. 429 rate_limited e 504 (resultado desconhecido para o cliente) aparecem lado a lado.",
+		}, []string{"route", "status"}),
+		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace, Name: "http_request_duration_seconds",
+			Help:    "Duração das requisições da API, por rota.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"route"}),
+	}
+	reg.MustRegister(m.requests, m.duration)
+	return m
+}
+
+// Request registra uma requisição atendida. route é o padrão do mux ("POST /instructions") ou
+// "unmatched"; sem label de método, porque numa rota inexistente ele vem do cliente e não tem teto.
+func (m *HTTP) Request(route string, status int, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.requests.WithLabelValues(route, strconv.Itoa(status)).Inc()
+	m.duration.WithLabelValues(route).Observe(d.Seconds())
+}
+
+// Participant reúne o que o participante simulado mede: a verdade do outro lado da fronteira,
+// para comparar com o que o processor enxerga. Aceita o receptor nulo, como Processor.
+type Participant struct {
+	payments  *prometheus.CounterVec
+	throttled prometheus.Counter
+}
+
+func NewParticipant(reg *prometheus.Registry) *Participant {
+	m := &Participant{
+		payments: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "participant_payments_total",
+			Help: "Instruções que o participante tratou, por comportamento e resultado: accepted, rejected, dropped (perdida, sem resposta) ou crashed (caiu antes de processar).",
+		}, []string{"behavior", "result"}),
+		throttled: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "participant_throttled_total",
+			Help: "Chegadas recusadas com 429 pelo participante: não processadas, reenviar é seguro.",
+		}),
+	}
+	reg.MustRegister(m.payments, m.throttled)
+	return m
+}
+
+func (m *Participant) Payment(behavior, result string) {
+	if m == nil {
+		return
+	}
+	m.payments.WithLabelValues(behavior, result).Inc()
+}
+
+func (m *Participant) Throttled() {
+	if m == nil {
+		return
+	}
+	m.throttled.Inc()
 }

@@ -1,6 +1,6 @@
 // main.go
 // Ponto de entrada do processo api: lê a configuração do ambiente (DATABASE_URL, JWT_SECRET,
-// ADDR, LOG_FORMAT, REQUEST_TIMEOUT, API_RATE_RPS, API_RATE_BURST), liga as peças e sobe o servidor HTTP.
+// ADDR, LOG_FORMAT, REQUEST_TIMEOUT, API_RATE_RPS, API_RATE_BURST, METRICS_ADDR), liga as peças e sobe o servidor HTTP.
 // Objetivo: ser a única "composition root" da API. É aqui, e só aqui, que o Postgres, os
 // casos de uso e o adapter HTTP se encontram, e onde todos os prazos ficam explícitos:
 // nenhum valor padrão do net/http ou do pgx decide por nós. Também desliga com elegância:
@@ -32,6 +32,7 @@ import (
 	"github.com/VictorM0nteiro/payrouter/internal/app"
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
 	"github.com/VictorM0nteiro/payrouter/internal/logging"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 )
 
 const (
@@ -49,6 +50,8 @@ const (
 	readTimeout       = 10 * time.Second
 	writeTimeout      = 15 * time.Second
 	idleTimeout       = 60 * time.Second
+
+	defaultMetricsAddr = ":9093"
 
 	// shutdownTimeout é quanto o desligamento espera as requisições em andamento. Fica abaixo
 	// do stop_grace_period do compose (15s), senão o SIGKILL chegaria antes.
@@ -101,6 +104,12 @@ func run() error {
 		rateBurst = max(1, int(math.Ceil(rateRPS)))
 	}
 
+	// METRICS_ADDR definida e vazia desliga as métricas; ausente usa o padrão.
+	metricsAddr, ok := os.LookupEnv("METRICS_ADDR")
+	if !ok {
+		metricsAddr = defaultMetricsAddr
+	}
+
 	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	poolCfg, err := pgxpool.ParseConfig(dsn)
@@ -126,9 +135,10 @@ func run() error {
 	authn := app.NewAuthenticateClient(postgres.NewClientStore(pool), signer)
 	api := httpapi.NewHandler(accept, get, authn, signer, httpapi.WithRateLimit(rateRPS, rateBurst))
 
+	reg := metrics.NewRegistry()
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.NewRoot(api, pool, requestTimeout),
+		Handler:           httpapi.NewRoot(api, pool, requestTimeout, httpapi.WithMetrics(metrics.NewHTTP(reg))),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -147,7 +157,18 @@ func run() error {
 	defer stop()
 	go func() { <-sigCtx.Done(); stop() }()
 
-	slog.Info("api ouvindo", "addr", addr, "request_timeout", requestTimeout.String())
+	metricsDone := make(chan struct{})
+	go func() {
+		defer close(metricsDone)
+		// As métricas são opcionais: se a porta não abrir, a API segue sem elas.
+		if err := metrics.Serve(sigCtx, metricsAddr, reg); err != nil {
+			slog.Error("api: servidor de métricas falhou", "addr", metricsAddr, "error", err)
+		}
+	}()
+	// Se a API cair sozinha, sem sinal, o stop() também encerra o servidor de métricas.
+	defer func() { stop(); <-metricsDone }()
+
+	slog.Info("api ouvindo", "addr", addr, "request_timeout", requestTimeout.String(), "metrics_addr", metricsAddr)
 	return serve(sigCtx, srv, ln, shutdownTimeout)
 }
 

@@ -162,6 +162,55 @@ func TestFilasSaoLidasNaColetaEOmitidasSeAConsultaFalha(t *testing.T) {
 	}
 }
 
+func TestRequisicoesHTTPContamPorRotaEStatus(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewHTTP(reg)
+
+	m.Request("POST /instructions", 429, time.Millisecond)
+	m.Request("POST /instructions", 504, 5*time.Second)
+	m.Request("POST /instructions", 504, 5*time.Second)
+
+	if got := value(t, reg, "payrouter_http_requests_total", map[string]string{"route": "POST /instructions", "status": "429"}); got != 1 {
+		t.Errorf("429 = %v, esperado 1", got)
+	}
+	if got := value(t, reg, "payrouter_http_requests_total", map[string]string{"route": "POST /instructions", "status": "504"}); got != 2 {
+		t.Errorf("504 = %v, esperado 2", got)
+	}
+	if got := value(t, reg, "payrouter_http_request_duration_seconds", map[string]string{"route": "POST /instructions"}); got != 3 {
+		t.Errorf("amostras de duração = %v, esperado 3", got)
+	}
+}
+
+func TestParticipanteSeparaProcessadoPerdidoEDerrubadoDoQueFoiRecusado(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewParticipant(reg)
+
+	m.Payment("accept", "accepted")
+	m.Payment("drop", "dropped")
+	m.Payment("crash", "crashed")
+	m.Throttled()
+	m.Throttled()
+
+	if got := value(t, reg, "payrouter_participant_payments_total", map[string]string{"behavior": "drop", "result": "dropped"}); got != 1 {
+		t.Errorf("dropped = %v, esperado 1", got)
+	}
+	if got := value(t, reg, "payrouter_participant_payments_total", map[string]string{"result": "accepted"}); got != 1 {
+		t.Errorf("accepted = %v, esperado 1", got)
+	}
+	if got := value(t, reg, "payrouter_participant_throttled_total", nil); got != 2 {
+		t.Errorf("429 = %v, esperado 2", got)
+	}
+}
+
+func TestReceptorNuloDeHTTPEParticipanteNaoFazNada(t *testing.T) {
+	var h *HTTP
+	var p *Participant
+
+	h.Request("GET /x", 200, time.Second)
+	p.Payment("accept", "accepted")
+	p.Throttled()
+}
+
 func freeAddr(t *testing.T) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")

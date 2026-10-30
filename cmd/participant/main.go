@@ -1,7 +1,7 @@
 // main.go
 // Ponto de entrada do processo participant: lê a configuração do ambiente (ADDR,
 // PARTICIPANT_BEHAVIOR, SLOW_DELAY, LATE_DELAY, REJECT_CODE, PARTICIPANT_TPS, PARTICIPANT_BURST,
-// LOG_FORMAT) e sobe o participante
+// METRICS_ADDR, LOG_FORMAT) e sobe o participante
 // simulado.
 // Objetivo: dar ao sistema uma contraparte externa configurável, que pode aceitar, rejeitar,
 // demorar, perder a mensagem, responder depois do timeout ou cair. O valor inválido de qualquer
@@ -22,11 +22,13 @@ import (
 	"time"
 
 	"github.com/VictorM0nteiro/payrouter/internal/logging"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 	"github.com/VictorM0nteiro/payrouter/internal/participant"
 )
 
 const (
-	defaultAddr = ":9090"
+	defaultAddr        = ":9090"
+	defaultMetricsAddr = ":9094"
 
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 10 * time.Second
@@ -77,6 +79,13 @@ func run() error {
 		addr = defaultAddr
 	}
 
+	// METRICS_ADDR definida e vazia desliga as métricas; ausente usa o padrão.
+	metricsAddr, ok := os.LookupEnv("METRICS_ADDR")
+	if !ok {
+		metricsAddr = defaultMetricsAddr
+	}
+	reg := metrics.NewRegistry()
+
 	handler := participant.New(participant.Config{
 		Default:    behavior,
 		SlowDelay:  slowDelay,
@@ -84,6 +93,7 @@ func run() error {
 		RejectCode: os.Getenv("REJECT_CODE"),
 		TPS:        tps,
 		Burst:      burst,
+		Metrics:    metrics.NewParticipant(reg),
 	})
 	srv := &http.Server{
 		Addr:              addr,
@@ -96,10 +106,21 @@ func run() error {
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	metricsDone := make(chan struct{})
+	go func() {
+		defer close(metricsDone)
+		// As métricas são opcionais: se a porta não abrir, o participante segue sem elas.
+		if err := metrics.Serve(sigCtx, metricsAddr, reg); err != nil {
+			slog.Error("participante: servidor de métricas falhou", "addr", metricsAddr, "error", err)
+		}
+	}()
+	// Em qualquer saída (sinal ou queda), o stop() encerra também o servidor de métricas.
+	defer func() { stop(); <-metricsDone }()
+
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
 	slog.Info("participante ouvindo", "addr", addr, "behavior", string(behavior),
-		"slow_delay", slowDelay.String(), "late_delay", lateDelay.String(), "tps", tps, "burst", burst)
+		"slow_delay", slowDelay.String(), "late_delay", lateDelay.String(), "tps", tps, "burst", burst, "metrics_addr", metricsAddr)
 
 	select {
 	case err := <-errc:

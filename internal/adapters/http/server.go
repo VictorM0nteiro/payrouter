@@ -15,6 +15,7 @@ import (
 	"github.com/VictorM0nteiro/payrouter/internal/app"
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
 	"github.com/VictorM0nteiro/payrouter/internal/logging"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 )
 
 // acceptor é o que o handler de POST /instructions precisa do caso de uso.
@@ -42,24 +43,41 @@ type handler struct {
 // readyTimeout é o prazo do ping do /readyz: uma sonda lenta conta como indisponível.
 const readyTimeout = 2 * time.Second
 
+// RootOption ajusta o NewRoot.
+type RootOption func(*root)
+
+type root struct {
+	metrics *metrics.HTTP // nil = sem métricas
+}
+
+// WithMetrics liga as métricas HTTP da API. Sem elas, nada é medido.
+func WithMetrics(m *metrics.HTTP) RootOption {
+	return func(r *root) { r.metrics = m }
+}
+
 // NewRoot junta tudo no handler que o http.Server serve: as sondas (sem log de acesso, sem
-// autenticação) e a API embrulhada em correlation ID, prazo por requisição e log de acesso.
-func NewRoot(api http.Handler, ready Pinger, requestTimeout time.Duration) http.Handler {
+// autenticação, sem métricas) e a API embrulhada em correlation ID, prazo por requisição, log de
+// acesso e métricas.
+func NewRoot(api http.Handler, ready Pinger, requestTimeout time.Duration, opts ...RootOption) http.Handler {
+	var cfg root
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	ops := NewOps(ready, readyTimeout)
 
 	root := http.NewServeMux()
 	// Sem método no padrão: o mux de ops é quem responde 405 a um POST nas sondas.
 	root.Handle("/healthz", ops)
 	root.Handle("/readyz", ops)
-	root.Handle("/", wrap(api, requestTimeout))
+	root.Handle("/", wrap(api, requestTimeout, cfg.metrics))
 	return root
 }
 
 // wrap aplica, numa única passada, o que toda requisição da API precisa: correlation ID (no
-// contexto, no log e no header da resposta), o prazo e o log de acesso. É uma função só, e
-// não três middlewares empilhados, porque o log de acesso precisa ler r.Pattern depois do
-// atendimento e o ServeMux o grava na requisição que ele recebe: tem de ser a mesma.
-func wrap(next http.Handler, requestTimeout time.Duration) http.Handler {
+// contexto, no log e no header da resposta), o prazo, o log de acesso e as métricas. É uma função
+// só, e não vários middlewares empilhados, porque o log e as métricas precisam ler r.Pattern
+// depois do atendimento e o ServeMux o grava na requisição que ele recebe: tem de ser a mesma.
+func wrap(next http.Handler, requestTimeout time.Duration, m *metrics.HTTP) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := correlationIDFor(r)
 		w.Header().Set(correlationHeader, id)
@@ -72,7 +90,9 @@ func wrap(next http.Handler, requestTimeout time.Duration) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 		next.ServeHTTP(rec, r)
-		logAccess(r, rec.status, info, time.Since(start))
+		took := time.Since(start)
+		logAccess(r, rec.status, info, took)
+		m.Request(routeOf(r), rec.status, took)
 	})
 }
 

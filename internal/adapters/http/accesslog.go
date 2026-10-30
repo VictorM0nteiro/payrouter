@@ -51,10 +51,6 @@ func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter 
 // logAccess escreve a linha de acesso. 5xx é erro, 499 (cliente desistiu) é aviso, o resto é
 // informação.
 func logAccess(r *http.Request, status int, info *requestInfo, took time.Duration) {
-	route := r.Pattern
-	if route == "" {
-		route = "unmatched"
-	}
 	level := slog.LevelInfo
 	switch {
 	case status >= 500:
@@ -64,9 +60,18 @@ func logAccess(r *http.Request, status int, info *requestInfo, took time.Duratio
 	}
 	slog.Default().Log(r.Context(), level, "request",
 		"method", r.Method,
-		"route", route,
+		"route", routeOf(r),
 		"status", status,
 		"duration_ms", took.Milliseconds(),
 		"client_id", info.clientID,
 	)
+}
+
+// routeOf é o padrão do mux que atendeu a requisição, ou "unmatched". Serve de rota no log e de
+// label nas métricas: nunca o caminho real, que teria um valor por id.
+func routeOf(r *http.Request) string {
+	if r.Pattern == "" {
+		return "unmatched"
+	}
+	return r.Pattern
 }
