@@ -173,7 +173,7 @@ interview and the one that will break most.
 | 15 | `ReconciliationExhausted` after N attempts; **the cruel-case test**: the participant answers after the timeout and reconciliation discovers the operation happened |
 | 16 | End-to-end test of the six participant behaviors |
 | 17 | Output rate limit: limiter before the send, partition `pause`/`resume`, `RoutingThrottled` on `429`. Plus the input token bucket ported from wallet-go |
-| 17b | Metrics from now on: Prometheus `/metrics` in api, relay, processor and participant (429 vs timeout, backpressure waits, reconciliation backlog and outcomes, outbox pending and age, API rate and latency), Prometheus + Grafana in compose with one provisioned dashboard, consumer-group lag scraped from Redpanda. Ported from wallet-go; no tracing yet (that stays in 26) |
+| 17b | Metrics from now on: Prometheus `/metrics` in api, relay, processor and participant (429 vs timeout, backpressure waits, reconciliation backlog and outcomes, outbox pending and age, API rate and latency), Prometheus + Grafana in compose with one provisioned dashboard. Ported from wallet-go; no tracing yet (that stays in 26). Done: consumer-group lag is NOT available from this Redpanda (v24.3.18 exposes none), so the dashboard shows records produced vs fetched and real lag by code moves to 26 |
 | 18 | `internal/elastic.WorkerPool`: min/max, growth by queue and wait, shrinking with hysteresis, `aggregate_id` affinity, contiguous offset watermark. Unit tests without Kafka, under `-race` |
 | 19 | Elastic connections to the participant: AIMD in-flight request limiter + `http.Transport` following the limit; pool integration into the processor |
 | 20 | Slack and accumulated debt |
@@ -214,7 +214,7 @@ the events.
 
 | Session | Deliverable |
 |---|---|
-| 26 | OTel: a trace crossing api → relay → Kafka → processor/projector. The Prometheus metrics and the Grafana dashboard already exist since 17b; here they gain the projector and the pool, and consumer lag by code (`kadm`) only if scraping Redpanda was not enough |
+| 26 | OTel: a trace crossing api → relay → Kafka → processor/projector. The Prometheus metrics and the Grafana dashboard already exist since 17b; here they gain the projector and the pool, and consumer lag by code (`kadm`), because the Redpanda in use exposes none (found in 17b) |
 | 27 | Load harness, lag instrumentation, deterministic seed |
 | 28 | Experiment 7.1: projection lag with 1, 2 and 4 consumers, two load levels |
 | 29 | Experiments 7.2 (replay with 10k/100k/1M) and 7.4 (participant saturation, fixed pool against elastic). 7.3 only if time is left |

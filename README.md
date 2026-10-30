@@ -49,7 +49,9 @@ without a conclusion it gives up and the instruction becomes `failed` (session 1
 end-to-end test runs all the participant behaviors through the whole pipeline (session 16). A
 `429` from the participant is the opposite of a timeout: definitely not processed, so the
 instruction returns to `accepted` and is resent; an output rate limit with backpressure keeps it
-from happening, and a per-client input limit protects the API (session 17). There is still no
+from happening, and a per-client input limit protects the API (session 17). Every binary now
+exposes Prometheus metrics, and the compose brings up Prometheus and one Grafana dashboard, so
+the 429-versus-timeout difference is something you can watch (session 17b). There is still no
 projection. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
@@ -58,7 +60,7 @@ projection. The full plan is in
 Requirements: Docker (with Compose) and `make`. On Windows, use Git Bash or WSL.
 
 ```bash
-make up            # creates .env with a random JWT_SECRET and brings up Postgres, migrations, Redpanda, API, relay, participant and processor
+make up            # creates .env with a random JWT_SECRET and brings up Postgres, migrations, Redpanda, API, relay, participant, processor, Prometheus and Grafana
 make demo-client   # registers the "demo" client and prints the client_secret (exactly once)
 ```
 
@@ -197,6 +199,7 @@ A loop inside the processor works the `reconciliation_tasks` queue.
 | `OUTPUT_TPS` | `0` (off) | output rate limit toward the participant, in sends per second |
 | `OUTPUT_BURST` | `ceil(OUTPUT_TPS)` | burst allowed above `OUTPUT_TPS` |
 | `KAFKA_GROUP` | `payrouter-processor` | consumer group |
+| `METRICS_ADDR` | `:9092` | where `/metrics` listens; set and empty turns it off |
 
 ### Rate limits and 429
 
@@ -224,6 +227,53 @@ Two failures that look alike in the log and must never be handled alike:
   its own bucket on `POST /instructions` and `GET /instructions/{id}`; over the limit it gets
   `429 rate_limited` with `Retry-After`, and the use case does not run. This `429` (API to
   client) is unrelated to the participant's `429`.
+
+## Metrics
+
+`make up` also starts Prometheus and Grafana. Both are bound to localhost only:
+
+| What | Where | Notes |
+|---|---|---|
+| Grafana | http://localhost:3000 | user `admin`, password `dev-grafana` (development only); the `payrouter` dashboard is already provisioned |
+| Prometheus | http://localhost:9099 | scrapes every 5 s; `/targets` shows each binary `up` |
+
+Each binary serves `GET /metrics` on its own port (`METRICS_ADDR`): relay `:9091`, processor
+`:9092`, API `:9093`, participant `:9094`. Those ports are NOT published to the host; only
+Prometheus reaches them, over the compose network. Every series exists because the boundary is
+asynchronous, and every label is a closed set (never an `aggregate_id` or `instruction_id`):
+
+| Series | What it answers |
+|---|---|
+| `payrouter_participant_calls_total{op,result}` | `throttled` (429, not processed) and `unknown` (no answer) are separate series: the point of session 17 |
+| `payrouter_routing_outcomes_total{outcome}` | what each send turned into: settled, rejected, throttled, unknown |
+| `payrouter_output_backpressure_*`, `payrouter_consumer_*` | how long the output limit held the queue, partition pauses, consumer results |
+| `payrouter_reconciliation_*` | queries by result (watch `exhausted`, which needs a human) and the pending task backlog |
+| `payrouter_outbox_pending`, `..._oldest_pending_age_seconds` | relay lag at the source |
+| `payrouter_http_*{route,status}` | API traffic by route pattern; `429` and `504` side by side |
+| `payrouter_participant_payments_total`, `..._throttled_total` | the participant's own count: ground truth to compare with the processor's |
+
+To see the 429 and the timeout apart, slow the participant and then put a limit in front of it
+(PowerShell; `make demo-client` gives the client secret, and the token comes from `/auth/token`):
+
+```powershell
+$env:PARTICIPANT_TPS = 2; docker compose up -d participant     # the participant refuses above 2/s
+1..30 | ForEach-Object {                                       # 30 instructions, no output limit
+  Invoke-RestMethod localhost:8080/instructions -Method Post -Headers @{Authorization="Bearer $token"; "Idempotency-Key"="a-$_"} `
+    -Body (@{debtor="a";creditor="b";amount_cents=15000;end_to_end_id="a-$_"} | ConvertTo-Json) | Out-Null }
+# Grafana, "429 vs timeout": throttled > 0, unknown = 0, everything ends settled
+
+$env:OUTPUT_TPS = 1; docker compose up -d processor            # now the processor limits itself below 2/s
+# repeat the loop with other keys: throttled stays near 0 and "Output limit" shows the waits
+```
+
+An instruction with `late:` in `end_to_end_id` shows the other side: `pay unknown` goes to 1, the
+reconciliation backlog to 1, and back to 0 when it resolves.
+
+Limits: `/metrics` has no authentication or TLS (it is only reachable inside the compose network);
+the relay and the processor each run one cheap Postgres query per scrape for the backlog gauges;
+there are no alert rules; and the Redpanda used here exposes no per-group consumer lag, so the
+dashboard shows records produced versus fetched as an indication (real lag by code is planned
+for session 26).
 
 ## Development
 
@@ -264,6 +314,7 @@ An already issued token is valid until it expires even if the client is deactiva
 | `REQUEST_TIMEOUT` | `5s` | deadline of each request, passed on to Postgres through the context |
 | `API_RATE_RPS` | `0` (off) | requests per second allowed per client; over it, `429 rate_limited` |
 | `API_RATE_BURST` | `ceil(API_RATE_RPS)` | burst allowed above `API_RATE_RPS` |
+| `METRICS_ADDR` | `:9093` | where `/metrics` listens (a separate port, not the API's); set and empty turns it off |
 
 ### Observability and deadlines
 
