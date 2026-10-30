@@ -173,6 +173,7 @@ interview and the one that will break most.
 | 15 | `ReconciliationExhausted` after N attempts; **the cruel-case test**: the participant answers after the timeout and reconciliation discovers the operation happened |
 | 16 | End-to-end test of the six participant behaviors |
 | 17 | Output rate limit: limiter before the send, partition `pause`/`resume`, `RoutingThrottled` on `429`. Plus the input token bucket ported from wallet-go |
+| 17b | Metrics from now on: Prometheus `/metrics` in api, relay, processor and participant (429 vs timeout, backpressure waits, reconciliation backlog and outcomes, outbox pending and age, API rate and latency), Prometheus + Grafana in compose with one provisioned dashboard, consumer-group lag scraped from Redpanda. Ported from wallet-go; no tracing yet (that stays in 26) |
 | 18 | `internal/elastic.WorkerPool`: min/max, growth by queue and wait, shrinking with hysteresis, `aggregate_id` affinity, contiguous offset watermark. Unit tests without Kafka, under `-race` |
 | 19 | Elastic connections to the participant: AIMD in-flight request limiter + `http.Transport` following the limit; pool integration into the processor |
 | 20 | Slack and accumulated debt |
@@ -213,7 +214,7 @@ the events.
 
 | Session | Deliverable |
 |---|---|
-| 26 | OTel: a trace crossing api → relay → Kafka → processor/projector; metrics for lag, attempts and the reconciliation queue |
+| 26 | OTel: a trace crossing api → relay → Kafka → processor/projector. The Prometheus metrics and the Grafana dashboard already exist since 17b; here they gain the projector and the pool, and consumer lag by code (`kadm`) only if scraping Redpanda was not enough |
 | 27 | Load harness, lag instrumentation, deterministic seed |
 | 28 | Experiment 7.1: projection lag with 1, 2 and 4 consumers, two load levels |
 | 29 | Experiments 7.2 (replay with 10k/100k/1M) and 7.4 (participant saturation, fixed pool against elastic). 7.3 only if time is left |
@@ -254,6 +255,7 @@ scenario the outbox exists to cover, and it is where you demonstrate that redeli
 | Phase D overruns | Session 16 does not close by week 11 | Cut `ReconciliationExhausted` with escalation and keep only the attempt limit |
 | The elastic pool reorders or loses a message when resizing | Property test fails: same aggregate out of order, or an offset committed ahead of an in-flight message | Pin the pool at a constant size, prove ordering and watermark, and only then turn elasticity on. If it does not close, experiment 7.4 compares only fixed pools and the limit is declared |
 | Partition `pause`/`resume` gets tangled | The consumer stops and does not come back, or duplicates | Start by limiting with a token bucket before the send and only then pause the partition. The limiter alone already avoids overrunning the participant; the pause is what avoids piling up in memory |
+| Metrics (17b) grow into a project of their own | The dashboard or the recorders take more than one session | Keep only the table of metrics in the 17b plan; drop the dashboard rows that no session after it reads. A metric that no decision uses does not get in |
 | Noisy measurement | Variation above 15% between repetitions | Change the environment before adding repetitions. The wallet-go lesson: a generator competing with the services produces a non-monotonic curve |
 | A hiring process opens before phase F | — | Stop at session 17, declare the state in the README, present it that way. The thesis is already proven |
 | Scope inflating | You are writing a saga, or a second aggregate | Reread the yardstick: does this only exist because the boundary is asynchronous? A saga does not get in |

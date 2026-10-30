@@ -530,6 +530,11 @@ CI          GitHub Actions · golangci-lint
 Standard library whenever the difference is small. On observability: OTel is vendor-neutral
 and exports to Datadog and New Relic — you can say that truthfully without paying anything.
 
+The metrics (Prometheus client, Grafana dashboard) arrive in session 17b, before the elastic
+pools, because those sessions need numbers while they happen. They reuse the wallet-go setup
+(own registry per binary, nil-safe recorders, route pattern as label). Labels are closed sets,
+never `aggregate_id`. The OTel trace stays in Phase F.
+
 ---
 
 ## 10. Structure of the final README
