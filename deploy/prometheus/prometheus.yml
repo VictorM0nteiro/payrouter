@@ -1,0 +1,33 @@
+# prometheus.yml
+# Configuração do Prometheus do payrouter: quem ele raspa e de quanto em quanto tempo.
+# Objetivo: os quatro binários e o Redpanda são alcançados pela rede do compose (as portas de
+# métricas não são publicadas no host). Raspar a cada 5 s mantém o gráfico vivo durante um
+# experimento sem pesar: a coleta do relay e do processor faz uma consulta ao Postgres.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ["api:9093"]
+
+  - job_name: relay
+    static_configs:
+      - targets: ["relay:9091"]
+
+  - job_name: processor
+    static_configs:
+      - targets: ["processor:9092"]
+
+  - job_name: participant
+    static_configs:
+      - targets: ["participant:9094"]
+
+  # Métricas públicas do Redpanda. Esta versão não expõe o lag por grupo de consumo: o gráfico de
+  # registros produzidos contra buscados é só um indicativo (o lag de verdade fica para a sessão 26).
+  - job_name: redpanda
+    metrics_path: /public_metrics
+    static_configs:
+      - targets: ["redpanda:9644"]

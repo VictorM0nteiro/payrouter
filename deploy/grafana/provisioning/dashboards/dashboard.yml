@@ -1,0 +1,16 @@
+# dashboard.yml
+# Provedor de dashboards do Grafana: carrega os JSON desta pasta.
+# Objetivo: o payrouter.json aparece sozinho ao subir o compose e é relido a cada 30 s se for
+# editado no disco.
+
+apiVersion: 1
+
+providers:
+  - name: payrouter
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards

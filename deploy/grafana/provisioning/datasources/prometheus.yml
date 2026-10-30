@@ -1,0 +1,15 @@
+# prometheus.yml
+# Fonte de dados do Grafana: o Prometheus do compose.
+# Objetivo: o dashboard já nasce ligado, sem ninguém configurar nada na interface. O uid fixo
+# é o que o payrouter.json referencia.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

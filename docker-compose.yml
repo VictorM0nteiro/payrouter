@@ -1,7 +1,11 @@
 # docker-compose.yml
 # Infraestrutura local do payrouter: PostgreSQL 16, as migrations, Redpanda (Kafka), a API,
-# o relay do outbox, o processor e o participante simulado. Mongo e Redis entram nas fases seguintes.
+# o relay do outbox, o processor, o participante simulado, o Prometheus e o Grafana. Mongo e
+# Redis entram nas fases seguintes.
 # Objetivo: `make env && make up` bastam para ter o sistema inteiro no ar, sem instalar nada.
+# As portas de métricas (/metrics) dos binários não são publicadas no host: só o Prometheus as
+# alcança, pela rede do compose. No host ficam o Prometheus (9099) e o Grafana (3000), os dois
+# presos a 127.0.0.1.
 # A ordem é garantida pelo compose: o Postgres fica saudável, as migrations rodam até o fim e
 # só então a API sobe; o relay espera também o tópico existir.
 
@@ -158,5 +162,47 @@ services:
       timeout: 3s
       retries: 10
 
+  # Coleta as métricas dos binários e do Redpanda (veja deploy/prometheus/prometheus.yml). Só no
+  # localhost: a porta 9090 do host já é do participante, por isso 9099.
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - api
+      - relay
+      - processor
+      - participant
+      - redpanda
+    ports:
+      - "127.0.0.1:9099:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # Dashboard provisionado (deploy/grafana). Senha só de desenvolvimento: usuário admin, senha
+  # dev-grafana. Preso ao localhost.
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: dev-grafana
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
 volumes:
   pgdata:
+  prometheus_data:
+  grafana_data:

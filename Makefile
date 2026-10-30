@@ -19,7 +19,7 @@ lint:
 env:
 	@test -f .env || { printf 'JWT_SECRET=%s\n' "$$(openssl rand -hex 32)" > .env && echo ".env criado"; }
 
-# Sobe tudo (Postgres, migrations, Redpanda, API, relay, processor, participante) e espera a API ficar pronta (/readyz).
+# Sobe tudo (Postgres, migrations, Redpanda, API, relay, processor, participante, Prometheus e Grafana) e espera a API ficar pronta (/readyz).
 up: env
 	docker compose up -d --build --wait
 
