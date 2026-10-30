@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 )
 
 // OutboxMessage é uma linha pendente do outbox, pronta para publicar.
@@ -40,15 +42,25 @@ type Relay struct {
 	publisher    Publisher
 	batchSize    int
 	pollInterval time.Duration
+	metrics      *metrics.Relay // nil = sem métricas
 }
 
 func NewRelay(store OutboxStore, publisher Publisher, batchSize int, pollInterval time.Duration) *Relay {
 	return &Relay{store: store, publisher: publisher, batchSize: batchSize, pollInterval: pollInterval}
 }
 
+// WithMetrics liga as métricas do relay. Sem elas, nada é medido.
+func (r *Relay) WithMetrics(m *metrics.Relay) *Relay {
+	r.metrics = m
+	return r
+}
+
 // run once faz uma rodada publica um lote e o marca. Devolve quantas msgs saíram
 func (r *Relay) RunOnce(ctx context.Context) (int, error) {
-	return r.store.Drain(ctx, r.batchSize, r.publisher.Publish)
+	start := time.Now()
+	n, err := r.store.Drain(ctx, r.batchSize, r.publisher.Publish)
+	r.metrics.Round(n, err, time.Since(start))
+	return n, err
 }
 
 // Run repete as rodadas até o contexto terminar. Havendo mensagens, a proxima rodada começa na hora

@@ -1,7 +1,7 @@
 // main.go
 // Ponto de entrada do processo processor: lê a configuração do ambiente (DATABASE_URL,
 // KAFKA_BROKERS, PARTICIPANT_URL, PARTICIPANT_TIMEOUT, RECONCILE_FIRST_DELAY, RECONCILE_BATCH, RECONCILE_POLL, RECONCILE_LEASE,
-// RECONCILE_BACKOFF_BASE, RECONCILE_BACKOFF_MAX,  RECONCILE_MAX_ATTEMPTS, OUTPUT_TPS, OUTPUT_BURST, KAFKA_GROUP, LOG_FORMAT), liga o
+// RECONCILE_BACKOFF_BASE, RECONCILE_BACKOFF_MAX,  RECONCILE_MAX_ATTEMPTS, OUTPUT_TPS, OUTPUT_BURST, KAFKA_GROUP, METRICS_ADDR, LOG_FORMAT), liga o
 // consumidor Kafka ao caso de uso e roda até receber SIGINT/SIGTERM.
 // Objetivo: ser a composition root do processor, o lado do comando que produz o efeito
 // colateral (enviar ao participante). No desligamento termina a mensagem em andamento antes
@@ -27,6 +27,7 @@ import (
 	"github.com/VictorM0nteiro/payrouter/internal/adapters/postgres"
 	"github.com/VictorM0nteiro/payrouter/internal/app"
 	"github.com/VictorM0nteiro/payrouter/internal/logging"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 	"github.com/VictorM0nteiro/payrouter/internal/ratelimit"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -34,6 +35,7 @@ import (
 const (
 	instructionsTopic  = "payrouter.instructions.events"
 	defaultGroup       = "payrouter-processor"
+	defaultMetricsAddr = ":9092"
 	defaultPayTimeout  = 3 * time.Second
 	defaultFirstDelay  = 5 * time.Second
 	defaultBatch       = 50
@@ -94,6 +96,11 @@ func run() error {
 	if group == "" {
 		group = defaultGroup
 	}
+	// METRICS_ADDR definida e vazia desliga as métricas; ausente usa o padrão.
+	metricsAddr, ok := os.LookupEnv("METRICS_ADDR")
+	if !ok {
+		metricsAddr = defaultMetricsAddr
+	}
 
 	startCtx, cancel := context.WithTimeout(context.Background(), startupPingTimeout)
 	defer cancel()
@@ -133,11 +140,19 @@ func run() error {
 		useCase.WithLimiter(ratelimit.New(outputTPS, outputBurst))
 	}
 	reconciler := app.NewReconcile(uow, client, reconcile)
+
+	reg := metrics.NewRegistry()
+	pm := metrics.NewProcessor(reg)
+	metrics.RegisterBacklog(reg, postgres.NewBacklogReader(pool).Read)
+	useCase.WithMetrics(pm)
+	reconciler.WithMetrics(pm)
+	consumer.WithMetrics(pm)
+
 	slog.Info("processor iniciado", "brokers", brokers, "group", group, "participant", participantURL,
 		"participant_timeout", payTimeout.String(), "reconcile_first_delay", firstDelay.String(),
 		"reconcile_poll", reconcile.Poll.String(), "reconcile_backoff_base", reconcile.BackoffBase.String(),
 		"reconcile_backoff_max", reconcile.BackoffMax.String(), "reconcile_max_attempts", reconcile.MaxAttempts,
-		"output_tps", outputTPS, "output_burst", outputBurst)
+		"output_tps", outputTPS, "output_burst", outputBurst, "metrics_addr", metricsAddr)
 
 	// A conciliação roda ao lado do consumidor; os dois param com o mesmo sinal.
 	var wg sync.WaitGroup
@@ -145,6 +160,14 @@ func run() error {
 	go func() {
 		defer wg.Done()
 		_ = reconciler.Run(sigCtx)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// As métricas são opcionais: se a porta não abrir, o processor segue sem elas.
+		if err := metrics.Serve(sigCtx, metricsAddr, reg); err != nil {
+			slog.Error("processor: servidor de métricas falhou", "addr", metricsAddr, "error", err)
+		}
 	}()
 	err = consumer.Run(sigCtx, useCase.Handle)
 	stop()

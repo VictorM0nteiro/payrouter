@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 )
 
 // ReconciliationTask é uma instrução em unknown à espera de consulta.
@@ -41,10 +42,17 @@ type Reconcile struct {
 	uow         UnitOfWork
 	participant Participant
 	cfg         ReconcileConfig
+	metrics     *metrics.Processor // nil = sem métricas
 }
 
 func NewReconcile(uow UnitOfWork, participant Participant, cfg ReconcileConfig) *Reconcile {
 	return &Reconcile{uow: uow, participant: participant, cfg: cfg}
+}
+
+// WithMetrics liga as métricas da conciliação. Sem elas, nada é medido.
+func (r *Reconcile) WithMetrics(m *metrics.Processor) *Reconcile {
+	r.metrics = m
+	return r
 }
 
 // Backoff é a espera depois da tentativa de número attempts (1 = a primeira consulta): dobra
@@ -128,7 +136,13 @@ func (r *Reconcile) reconcile(ctx context.Context, t ReconciliationTask) error {
 	}
 
 	// A consulta acontece fora de qualquer transação. Falha ou not_found não resolvem nada.
+	start := time.Now()
 	res, qerr := r.participant.Status(ctx, string(t.ID))
+	if qerr != nil {
+		r.metrics.Call("status", "unknown", time.Since(start))
+	} else {
+		r.metrics.Call("status", "ok", time.Since(start))
+	}
 	expected := p.Version() // lida ANTES dos comandos: depois deles já é a versão nova
 	events, resolved, err := r.apply(p, res, qerr, t.Attempts+1)
 	if err != nil {
@@ -149,6 +163,17 @@ func (r *Reconcile) reconcile(ctx context.Context, t ReconciliationTask) error {
 		// Outro processo resolveu a instrução entre a leitura e a gravação.
 		slog.InfoContext(ctx, "conciliação: instrução já resolvida por outro caminho", "instruction_id", string(t.ID))
 		return r.finish(ctx, t.ID)
+	}
+	if err == nil {
+		// apply já moveu p: failed aqui significa que a última consulta esgotou as tentativas.
+		switch {
+		case !resolved:
+			r.metrics.Reconciled("inconclusive")
+		case p.Status() == domain.StatusFailed:
+			r.metrics.Reconciled("exhausted")
+		default:
+			r.metrics.Reconciled("resolved")
+		}
 	}
 	if err == nil && resolved {
 		slog.InfoContext(ctx, "conciliação: unknown resolvido pela consulta", "instruction_id", string(t.ID),

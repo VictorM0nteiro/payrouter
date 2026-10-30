@@ -1,6 +1,6 @@
 // main.go
 // Ponto de entrada do processo relay: lê a configuração do ambiente (DATABASE_URL,
-// KAFKA_BROKERS, RELAY_BATCH, RELAY_POLL, LOG_FORMAT), liga o outbox do Postgres ao produtor
+// KAFKA_BROKERS, RELAY_BATCH, RELAY_POLL, METRICS_ADDR, LOG_FORMAT), liga o outbox do Postgres ao produtor
 // Kafka e roda o laço de publicação até receber SIGINT/SIGTERM.
 // Objetivo: ser a composition root do relay. Publica o outbox e só depois o marca como
 // publicado (at-least-once, assumido). No desligamento termina a rodada em andamento antes de
@@ -23,12 +23,14 @@ import (
 	"github.com/VictorM0nteiro/payrouter/internal/adapters/postgres"
 	"github.com/VictorM0nteiro/payrouter/internal/app"
 	"github.com/VictorM0nteiro/payrouter/internal/logging"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
-	defaultBatch = 100
-	defaultPoll  = 500 * time.Millisecond
+	defaultBatch       = 100
+	defaultPoll        = 500 * time.Millisecond
+	defaultMetricsAddr = ":9091"
 
 	// Prazos do pool do Postgres, os mesmos da API.
 	connectTimeout    = 5 * time.Second
@@ -92,9 +94,26 @@ func run() error {
 	defer stop()
 	go func() { <-sigCtx.Done(); stop() }()
 
-	relay := app.NewRelay(postgres.NewOutboxStore(pool), producer, batch, poll)
-	slog.Info("relay iniciado", "brokers", brokers, "batch", batch, "poll", poll.String())
+	// METRICS_ADDR definida e vazia desliga as métricas; ausente usa o padrão.
+	metricsAddr, ok := os.LookupEnv("METRICS_ADDR")
+	if !ok {
+		metricsAddr = defaultMetricsAddr
+	}
+	reg := metrics.NewRegistry()
+	metrics.RegisterBacklog(reg, postgres.NewBacklogReader(pool).Read)
+	relay := app.NewRelay(postgres.NewOutboxStore(pool), producer, batch, poll).WithMetrics(metrics.NewRelay(reg))
+	metricsDone := make(chan struct{})
+	go func() {
+		defer close(metricsDone)
+		// As métricas são opcionais: se a porta não abrir, o relay segue sem elas.
+		if err := metrics.Serve(sigCtx, metricsAddr, reg); err != nil {
+			slog.Error("relay: servidor de métricas falhou", "addr", metricsAddr, "error", err)
+		}
+	}()
+	slog.Info("relay iniciado", "brokers", brokers, "batch", batch, "poll", poll.String(), "metrics_addr", metricsAddr)
 	err = relay.Run(sigCtx)
+	stop()
+	<-metricsDone
 	slog.Info("relay encerrado")
 	return err
 }

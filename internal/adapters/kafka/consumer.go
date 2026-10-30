@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/VictorM0nteiro/payrouter/internal/app"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -37,7 +38,14 @@ type Handler func(ctx context.Context, msg app.Message) error
 
 // Consumer lê um tópico em grupo.
 type Consumer struct {
-	client *kgo.Client
+	client  *kgo.Client
+	metrics *metrics.Processor // nil = sem métricas
+}
+
+// WithMetrics liga as métricas do consumidor. Sem elas, nada é medido.
+func (c *Consumer) WithMetrics(m *metrics.Processor) *Consumer {
+	c.metrics = m
+	return c
 }
 
 // NewConsumer entra no grupo para ler o tópico. Sem offset salvo, começa do início, para
@@ -97,6 +105,7 @@ func (c *Consumer) process(ctx context.Context, handle Handler, r *kgo.Record) b
 	msg, err := toMessage(r)
 	if err != nil {
 		slog.ErrorContext(ctx, "consumer: mensagem inválida descartada", "partition", r.Partition, "offset", r.Offset, "error", err)
+		c.metrics.Record("invalid")
 		return true
 	}
 
@@ -110,18 +119,23 @@ func (c *Consumer) process(ctx context.Context, handle Handler, r *kgo.Record) b
 		cancel()
 		switch {
 		case err == nil:
+			c.metrics.Record("ok")
 			return true
 		case errors.Is(err, app.ErrOutcomeUnknown):
 			slog.WarnContext(ctx, "consumer: resultado desconhecido, não será reenviado", "instruction_id", msg.AggregateID, "error", err)
+			c.metrics.Record("unknown")
 			return true
 		}
 		var bp *app.BackpressureError
 		if errors.As(err, &bp) {
+			c.metrics.Record("backpressure")
+			c.metrics.Pause()
 			if !c.pauseAndWait(ctx, r, bp.After) {
 				return false
 			}
 			continue
 		}
+		c.metrics.Record("error")
 		slog.ErrorContext(ctx, "consumer: erro transitório, repetindo a mensagem", "instruction_id", msg.AggregateID,
 			"error", err, "retry_in", backoff.String())
 		select {

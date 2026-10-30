@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 )
 
 const (
@@ -115,8 +116,9 @@ type Message struct {
 type ProcessInstruction struct {
 	uow         UnitOfWork
 	participant Participant
-	firstDelay  time.Duration // espera até a primeira consulta de conciliação
-	limiter     Limiter       // limite de saída; nil = sem limite
+	firstDelay  time.Duration      // espera até a primeira consulta de conciliação
+	limiter     Limiter            // limite de saída; nil = sem limite
+	metrics     *metrics.Processor // nil = sem métricas
 }
 
 func NewProcessInstruction(uow UnitOfWork, participant Participant, firstDelay time.Duration) *ProcessInstruction {
@@ -127,6 +129,12 @@ func NewProcessInstruction(uow UnitOfWork, participant Participant, firstDelay t
 // instrução. Sem limiter, nada é limitado.
 func (uc *ProcessInstruction) WithLimiter(l Limiter) *ProcessInstruction {
 	uc.limiter = l
+	return uc
+}
+
+// WithMetrics liga as métricas do processor. Sem elas, nada é medido.
+func (uc *ProcessInstruction) WithMetrics(m *metrics.Processor) *ProcessInstruction {
+	uc.metrics = m
 	return uc
 }
 
@@ -149,6 +157,7 @@ func (uc *ProcessInstruction) Handle(ctx context.Context, msg Message) error {
 	// ficha.
 	if uc.limiter != nil {
 		if wait := uc.limiter.Reserve(); wait > 0 {
+			uc.metrics.Backpressure(wait)
 			return &BackpressureError{After: wait}
 		}
 	}
@@ -204,14 +213,20 @@ func (uc *ProcessInstruction) Handle(ctx context.Context, msg Message) error {
 	}
 
 	// O efeito colateral. Daqui em diante um erro nunca autoriza reenviar.
+	start := time.Now()
 	result, err := uc.participant.Pay(ctx, request)
 	var throttled *ThrottledError
 	if errors.As(err, &throttled) {
+		uc.metrics.Call("pay", "throttled", time.Since(start))
+		uc.metrics.Outcome("throttled")
 		return uc.recordThrottle(ctx, p, throttled)
 	}
 	if err != nil {
+		uc.metrics.Call("pay", "unknown", time.Since(start))
+		uc.metrics.Outcome("unknown")
 		return uc.recordUnknown(ctx, p, asUnknown(err))
 	}
+	uc.metrics.Call("pay", "ok", time.Since(start))
 
 	return uc.apply(ctx, p, result)
 }
@@ -226,8 +241,10 @@ func (uc *ProcessInstruction) apply(ctx context.Context, p *domain.PaymentInstru
 	switch result.Status {
 	case PaymentAccepted:
 		event, err = p.Settle()
+		uc.metrics.Outcome("settled")
 	case PaymentRejected:
 		event, err = p.Reject(result.Code)
+		uc.metrics.Outcome("rejected")
 	default:
 		return fmt.Errorf("instrução %s: status %q do participante: %w", p.ID(), result.Status, ErrOutcomeUnknown)
 	}
