@@ -43,6 +43,22 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 	}
 }
 
+// WithPool dá ao cliente um Transport próprio, dimensionado para o teto do limite de requisições
+// em voo: conexões ociosas até maxIdle por host, fechadas depois de idleTTL sem uso. Chamar antes
+// do primeiro uso. O Transport não segue o limite atual porque MaxConnsPerHost não pode mudar
+// com o Transport em uso; quem limita as requisições em voo é o limitador, e a cada queda do
+// limite o chamador fecha as conexões ociosas com CloseIdleConnections.
+func (c *Client) WithPool(maxIdle int, idleTTL time.Duration) *Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConnsPerHost = maxIdle
+	t.IdleConnTimeout = idleTTL
+	c.http.Transport = t
+	return c
+}
+
+// CloseIdleConnections fecha as conexões ociosas; as em uso não são tocadas.
+func (c *Client) CloseIdleConnections() { c.http.CloseIdleConnections() }
+
 type payRequest struct {
 	InstructionID string `json:"instruction_id"`
 	AmountCents   int64  `json:"amount_cents"`

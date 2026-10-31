@@ -79,6 +79,7 @@ type Processor struct {
 	reconciled       *prometheus.CounterVec
 	records          *prometheus.CounterVec
 	pauses           prometheus.Counter
+	limitChanges     *prometheus.CounterVec
 }
 
 // NewProcessor cria e registra as métricas do processor em reg.
@@ -117,9 +118,43 @@ func NewProcessor(reg *prometheus.Registry) *Processor {
 			Namespace: namespace, Name: "consumer_partition_pauses_total",
 			Help: "Vezes em que o consumidor pausou uma partição esperando o limite de saída.",
 		}),
+		limitChanges: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "participant_limit_changes_total",
+			Help: "Mudanças do limite adaptativo de requisições em voo, por direção: up ou down.",
+		}, []string{"direction"}),
 	}
-	reg.MustRegister(m.calls, m.callDuration, m.outcomes, m.backpressure, m.backpressureWait, m.reconciled, m.records, m.pauses)
+	reg.MustRegister(m.calls, m.callDuration, m.outcomes, m.backpressure, m.backpressureWait, m.reconciled, m.records, m.pauses, m.limitChanges)
 	return m
+}
+
+// LimitChanged registra uma mudança do limite adaptativo de requisições em voo.
+func (m *Processor) LimitChanged(from, to int) {
+	if m == nil {
+		return
+	}
+	direction := "up"
+	if to < from {
+		direction = "down"
+	}
+	m.limitChanges.WithLabelValues(direction).Inc()
+}
+
+// RegisterLimiter expõe o estado do limitador adaptativo, lido na hora do scrape: o limite
+// atual, as requisições em voo e os chamadores esperando uma vaga.
+func RegisterLimiter(reg *prometheus.Registry, stats func() (limit, inflight, waiting int)) {
+	gauge := func(name, help string, pick func(limit, inflight, waiting int) int) prometheus.GaugeFunc {
+		return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: namespace, Name: name, Help: help}, func() float64 {
+			return float64(pick(stats()))
+		})
+	}
+	reg.MustRegister(
+		gauge("participant_limit", "Limite adaptativo atual de requisições em voo ao participante.",
+			func(limit, _, _ int) int { return limit }),
+		gauge("participant_inflight", "Requisições em voo ao participante agora.",
+			func(_, inflight, _ int) int { return inflight }),
+		gauge("participant_limit_waiting", "Chamadores esperando uma vaga de requisição em voo.",
+			func(_, _, waiting int) int { return waiting }),
+	)
 }
 
 // Call registra uma chamada ao participante. op é "pay" ou "status"; result, "ok", "throttled"

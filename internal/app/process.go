@@ -55,6 +55,22 @@ type Limiter interface {
 	Reserve() time.Duration
 }
 
+type SendOutcome int
+
+const (
+	SendOK        SendOutcome = iota // resposta conclusiva do participante
+	SendThrottled                    // 429: não processado
+	SendUnknown                      // sem resposta conclusiva: o limite cai, nada é reenviado
+	SendUnused                       // a vaga foi tomada mas nenhuma requisição saiu
+)
+
+// Concurrency é o limite de requisições EM VOO rumo ao participante (o do Limiter é por tempo).
+// Acquire espera uma vaga e devolve a função que a devolve com o resultado. Um erro de Acquire
+// (contexto) acontece ANTES de gravar qualquer coisa, então nunca deixa instrução presa.
+type Concurrency interface {
+	Acquire(ctx context.Context) (release func(SendOutcome), err error)
+}
+
 // BackpressureError diz ao consumidor para esperar After e repetir a MESMA mensagem: o limite de
 // saída está cheio. Nada foi gravado, então esperar não deixa instrução presa em in_flight. O
 // consumidor pausa a partição enquanto espera, e a mensagem nunca é descartada: o lag cresce e
@@ -116,8 +132,9 @@ type Message struct {
 type ProcessInstruction struct {
 	uow         UnitOfWork
 	participant Participant
-	firstDelay  time.Duration      // espera até a primeira consulta de conciliação
-	limiter     Limiter            // limite de saída; nil = sem limite
+	firstDelay  time.Duration // espera até a primeira consulta de conciliação
+	limiter     Limiter       // limite de saída; nil = sem limite
+	concurrency Concurrency
 	metrics     *metrics.Processor // nil = sem métricas
 }
 
@@ -129,6 +146,13 @@ func NewProcessInstruction(uow UnitOfWork, participant Participant, firstDelay t
 // instrução. Sem limiter, nada é limitado.
 func (uc *ProcessInstruction) WithLimiter(l Limiter) *ProcessInstruction {
 	uc.limiter = l
+	return uc
+}
+
+// WithConcurrency liga o limite de requisições em voo: cada envio toma uma vaga ANTES de
+// reivindicar a instrução e a devolve logo depois do Pay. Sem ele, nada limita a concorrência.
+func (uc *ProcessInstruction) WithConcurrency(c Concurrency) *ProcessInstruction {
+	uc.concurrency = c
 	return uc
 }
 
@@ -160,6 +184,26 @@ func (uc *ProcessInstruction) Handle(ctx context.Context, msg Message) error {
 			uc.metrics.Backpressure(wait)
 			return &BackpressureError{After: wait}
 		}
+	}
+
+	// A vaga em voo também vem antes da reivindicação: esperar por ela depois de gravar o
+	// RoutingAttempted deixaria a instrução em in_flight sem nada enviado, e um contexto vencido
+	// ali pareceria um envio sem resposta. Aqui, esperar não grava nada. A devolução por defer
+	// cobre toda saída sem envio (repetida, reivindicada por outro, erro de gravação).
+	release := func(SendOutcome) {}
+	if uc.concurrency != nil {
+		r, err := uc.concurrency.Acquire(ctx)
+		if err != nil {
+			return err
+		}
+		released := false
+		release = func(o SendOutcome) {
+			if !released {
+				released = true
+				r(o)
+			}
+		}
+		defer release(SendUnused)
 	}
 
 	// Reivindica: relê o agregado e grava RoutingAttempted com a versão esperada. A
@@ -216,6 +260,16 @@ func (uc *ProcessInstruction) Handle(ctx context.Context, msg Message) error {
 	start := time.Now()
 	result, err := uc.participant.Pay(ctx, request)
 	var throttled *ThrottledError
+	// A vaga volta assim que o participante respondeu (ou não), antes de gravar a resposta: a
+	// gravação não é uma requisição em voo.
+	switch {
+	case errors.As(err, &throttled):
+		release(SendThrottled)
+	case err != nil:
+		release(SendUnknown)
+	default:
+		release(SendOK)
+	}
 	if errors.As(err, &throttled) {
 		uc.metrics.Call("pay", "throttled", time.Since(start))
 		uc.metrics.Outcome("throttled")

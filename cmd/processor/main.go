@@ -1,7 +1,8 @@
 // main.go
 // Ponto de entrada do processo processor: lê a configuração do ambiente (DATABASE_URL,
 // KAFKA_BROKERS, PARTICIPANT_URL, PARTICIPANT_TIMEOUT, RECONCILE_FIRST_DELAY, RECONCILE_BATCH, RECONCILE_POLL, RECONCILE_LEASE,
-// RECONCILE_BACKOFF_BASE, RECONCILE_BACKOFF_MAX,  RECONCILE_MAX_ATTEMPTS, OUTPUT_TPS, OUTPUT_BURST, KAFKA_GROUP, METRICS_ADDR, LOG_FORMAT), liga o
+// RECONCILE_BACKOFF_BASE, RECONCILE_BACKOFF_MAX,  RECONCILE_MAX_ATTEMPTS, OUTPUT_TPS, OUTPUT_BURST,
+// PARTICIPANT_LIMIT_MAX, PARTICIPANT_LIMIT_MIN, PARTICIPANT_LIMIT_INIT, PARTICIPANT_IDLE_TTL, KAFKA_GROUP, METRICS_ADDR, LOG_FORMAT), liga o
 // consumidor Kafka ao caso de uso e roda até receber SIGINT/SIGTERM.
 // Objetivo: ser a composition root do processor, o lado do comando que produz o efeito
 // colateral (enviar ao participante). No desligamento termina a mensagem em andamento antes
@@ -26,6 +27,7 @@ import (
 	"github.com/VictorM0nteiro/payrouter/internal/adapters/participant"
 	"github.com/VictorM0nteiro/payrouter/internal/adapters/postgres"
 	"github.com/VictorM0nteiro/payrouter/internal/app"
+	"github.com/VictorM0nteiro/payrouter/internal/elastic"
 	"github.com/VictorM0nteiro/payrouter/internal/logging"
 	"github.com/VictorM0nteiro/payrouter/internal/metrics"
 	"github.com/VictorM0nteiro/payrouter/internal/ratelimit"
@@ -44,6 +46,7 @@ const (
 	defaultBackoffBase = 5 * time.Second
 	defaultBackoffMax  = time.Minute
 	defaultMaxAttempts = 10
+	defaultIdleTTL     = 30 * time.Second
 	connectTimeout     = 5 * time.Second
 	maxConnLifetime    = 30 * time.Minute
 	healthCheckPeriod  = 30 * time.Second
@@ -95,6 +98,14 @@ func run() error {
 		if outputBurst, err = intFromEnv("OUTPUT_BURST", 0); err != nil {
 			return err
 		}
+	}
+	limit, err := limiterConfig()
+	if err != nil {
+		return err
+	}
+	idleTTL, err := durationFromEnv("PARTICIPANT_IDLE_TTL", defaultIdleTTL)
+	if err != nil {
+		return err
 	}
 	group := os.Getenv("KAFKA_GROUP")
 	if group == "" {
@@ -151,12 +162,29 @@ func run() error {
 	useCase.WithMetrics(pm)
 	reconciler.WithMetrics(pm)
 	consumer.WithMetrics(pm)
+	if limit.Max > 0 {
+		// O Transport é dimensionado para o teto; a cada queda do limite as conexões ociosas fecham.
+		limit.OnChange = func(from, to int) {
+			pm.LimitChanged(from, to)
+			if to < from {
+				client.CloseIdleConnections()
+			}
+		}
+		limiter := elastic.NewLimiter(limit)
+		client.WithPool(limit.Max, idleTTL)
+		useCase.WithConcurrency(concurrency{limiter})
+		metrics.RegisterLimiter(reg, func() (int, int, int) {
+			s := limiter.Stats()
+			return s.Limit, s.InFlight, s.Waiting
+		})
+	}
 
 	slog.Info("processor iniciado", "brokers", brokers, "group", group, "participant", participantURL,
 		"participant_timeout", payTimeout.String(), "reconcile_first_delay", firstDelay.String(),
 		"reconcile_poll", reconcile.Poll.String(), "reconcile_backoff_base", reconcile.BackoffBase.String(),
 		"reconcile_backoff_max", reconcile.BackoffMax.String(), "reconcile_max_attempts", reconcile.MaxAttempts,
-		"output_tps", outputTPS, "output_burst", outputBurst, "metrics_addr", metricsAddr)
+		"output_tps", outputTPS, "output_burst", outputBurst, "limit_min", limit.Min, "limit_max", limit.Max,
+		"limit_init", limit.Initial, "idle_ttl", idleTTL.String(), "metrics_addr", metricsAddr)
 
 	// A conciliação roda ao lado do consumidor; os dois param com o mesmo sinal.
 	var wg sync.WaitGroup
@@ -204,6 +232,28 @@ func reconcileConfig() (app.ReconcileConfig, error) {
 	}
 	if cfg.BackoffMax < cfg.BackoffBase {
 		return cfg, fmt.Errorf("RECONCILE_BACKOFF_MAX (%s) menor que RECONCILE_BACKOFF_BASE (%s)", cfg.BackoffMax, cfg.BackoffBase)
+	}
+	return cfg, nil
+}
+
+// limiterConfig lê os parâmetros do limite adaptativo de requisições em voo. PARTICIPANT_LIMIT_MAX
+// ausente ou 0 desliga o limite (Max 0); ligado, o inicial padrão é o piso.
+func limiterConfig() (elastic.LimiterConfig, error) {
+	var cfg elastic.LimiterConfig
+	var err error
+	if os.Getenv("PARTICIPANT_LIMIT_MAX") != "0" {
+		if cfg.Max, err = intFromEnv("PARTICIPANT_LIMIT_MAX", 0); err != nil {
+			return cfg, err
+		}
+	}
+	if cfg.Min, err = intFromEnv("PARTICIPANT_LIMIT_MIN", 1); err != nil {
+		return cfg, err
+	}
+	if cfg.Initial, err = intFromEnv("PARTICIPANT_LIMIT_INIT", cfg.Min); err != nil {
+		return cfg, err
+	}
+	if cfg.Max > 0 && (cfg.Min > cfg.Max || cfg.Initial < cfg.Min || cfg.Initial > cfg.Max) {
+		return cfg, fmt.Errorf("PARTICIPANT_LIMIT: é preciso MIN (%d) <= INIT (%d) <= MAX (%d)", cfg.Min, cfg.Initial, cfg.Max)
 	}
 	return cfg, nil
 }
