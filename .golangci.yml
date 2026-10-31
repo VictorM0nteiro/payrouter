@@ -32,3 +32,21 @@ linters:
               desc: o domínio não conhece Mongo
             - pkg: github.com/redis/go-redis
               desc: o domínio não conhece Redis
+        elastic-puro:
+          files:
+            - "**/internal/elastic/**"
+          deny:
+            - pkg: net/http
+              desc: o pool elástico não conhece HTTP
+            - pkg: database/sql
+              desc: o pool elástico não conhece banco
+            - pkg: github.com/jackc/pgx
+              desc: o pool elástico não conhece Postgres
+            - pkg: github.com/twmb/franz-go
+              desc: o pool elástico não conhece Kafka
+            - pkg: github.com/VictorM0nteiro/payrouter/internal/app
+              desc: o pool elástico é genérico e não depende do núcleo
+            - pkg: github.com/VictorM0nteiro/payrouter/internal/adapters
+              desc: o pool elástico é genérico e não depende de adapters
+            - pkg: github.com/VictorM0nteiro/payrouter/internal/metrics
+              desc: as métricas se ligam por fora, via Stats e OnResize
