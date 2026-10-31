@@ -136,6 +136,11 @@ services:
       RECONCILE_MAX_ATTEMPTS: ${RECONCILE_MAX_ATTEMPTS:-10}
       OUTPUT_TPS: ${OUTPUT_TPS:-0}
       OUTPUT_BURST: ${OUTPUT_BURST:-0}
+      # Limite adaptativo de requisições em voo (AIMD). MAX=0 desliga; INIT vazio = igual ao piso.
+      PARTICIPANT_LIMIT_MAX: ${PARTICIPANT_LIMIT_MAX:-0}
+      PARTICIPANT_LIMIT_MIN: ${PARTICIPANT_LIMIT_MIN:-1}
+      PARTICIPANT_LIMIT_INIT: ${PARTICIPANT_LIMIT_INIT:-}
+      PARTICIPANT_IDLE_TTL: ${PARTICIPANT_IDLE_TTL:-30s}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     restart: unless-stopped
     # Termina a mensagem em andamento ao receber SIGTERM; o envio tem prazo próprio.

@@ -930,6 +930,129 @@
     },
     {
       "type": "row",
+      "title": "Participant concurrency limit (AIMD)",
+      "id": 28,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 87
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "In-flight limit, in flight and waiting",
+      "id": 29,
+      "description": "The AIMD limit moves between PARTICIPANT_LIMIT_MIN and _MAX: it halves on a 429 or a timeout and grows slowly on success. No series here means PARTICIPANT_LIMIT_MAX is 0 (off).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "payrouter_participant_limit",
+          "legendFormat": "limit"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "payrouter_participant_inflight",
+          "legendFormat": "in flight"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "payrouter_participant_limit_waiting",
+          "legendFormat": "waiting for a slot"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Limit changes, by direction",
+      "id": 30,
+      "description": "Each step of the limit per minute. A timeout never resends: it only lowers the limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (direction) (increase(payrouter_participant_limit_changes_total[1m]))",
+          "legendFormat": "{{direction}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
       "title": "Redpanda and processes",
       "id": 25,
       "collapsed": false,
@@ -937,7 +1060,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 87
+        "y": 96
       },
       "panels": []
     },
@@ -954,7 +1077,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 88
+        "y": 97
       },
       "fieldConfig": {
         "defaults": {
@@ -1009,7 +1132,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 88
+        "y": 97
       },
       "fieldConfig": {
         "defaults": {
