@@ -1053,6 +1053,147 @@
     },
     {
       "type": "row",
+      "title": "Elastic worker pool",
+      "id": 31,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Workers, target, running and ready",
+      "id": 32,
+      "description": "The pool grows when tasks wait and shrinks slowly (PROCESSOR_WORKERS_MIN/MAX). Running above the in-flight limit just means workers waiting for a slot. Flat at 1 means MAX is not set.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 97
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "payrouter_pool_workers",
+          "legendFormat": "workers"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "payrouter_pool_target_workers",
+          "legendFormat": "target"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "payrouter_pool_running_tasks",
+          "legendFormat": "running"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "payrouter_pool_ready_tasks",
+          "legendFormat": "ready, not started"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Resizes and offset commits, by result",
+      "id": 33,
+      "description": "Resizes per minute by direction, and consumer commits by result. A commit error means the messages are redelivered (safe: the consumer is idempotent by version).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 97
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (direction) (increase(payrouter_pool_resizes_total[1m]))",
+          "legendFormat": "resize {{direction}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (result) (increase(payrouter_consumer_commits_total[1m]))",
+          "legendFormat": "commit {{result}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
       "title": "Redpanda and processes",
       "id": 25,
       "collapsed": false,
@@ -1060,7 +1201,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 96
+        "y": 105
       },
       "panels": []
     },
@@ -1077,7 +1218,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 97
+        "y": 106
       },
       "fieldConfig": {
         "defaults": {
@@ -1132,7 +1273,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 97
+        "y": 106
       },
       "fieldConfig": {
         "defaults": {

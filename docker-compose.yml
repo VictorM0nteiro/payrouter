@@ -141,6 +141,9 @@ services:
       PARTICIPANT_LIMIT_MIN: ${PARTICIPANT_LIMIT_MIN:-1}
       PARTICIPANT_LIMIT_INIT: ${PARTICIPANT_LIMIT_INIT:-}
       PARTICIPANT_IDLE_TTL: ${PARTICIPANT_IDLE_TTL:-30s}
+      PROCESSOR_WORKERS_MIN: ${PROCESSOR_WORKERS_MIN:-1}
+      PROCESSOR_WORKERS_MAX: ${PROCESSOR_WORKERS_MAX:-}
+      PROCESSOR_QUEUE: ${PROCESSOR_QUEUE:-64}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     restart: unless-stopped
     # Termina a mensagem em andamento ao receber SIGTERM; o envio tem prazo próprio.

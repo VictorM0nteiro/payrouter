@@ -201,6 +201,8 @@ A loop inside the processor works the `reconciliation_tasks` queue.
 | `PARTICIPANT_LIMIT_MAX` | `0` (off) | ceiling of the adaptive limit of requests in flight toward the participant (AIMD) |
 | `PARTICIPANT_LIMIT_MIN`, `PARTICIPANT_LIMIT_INIT` | `1`, `MIN` | floor and starting point of that limit; `MIN <= INIT <= MAX` or the processor does not start |
 | `PARTICIPANT_IDLE_TTL` | `30s` | how long an idle connection to the participant stays open |
+| `PROCESSOR_WORKERS_MIN`, `PROCESSOR_WORKERS_MAX` | `1`, `MIN` | floor and ceiling of the consumer's worker pool; with `1` and `1` the processor handles one message at a time, as before; `MAX < MIN` and the processor does not start |
+| `PROCESSOR_QUEUE` | `64` | messages the pool accepts without a free worker; beyond that the consumer stops reading (backpressure) |
 | `KAFKA_GROUP` | `payrouter-processor` | consumer group |
 | `METRICS_ADDR` | `:9092` | where `/metrics` listens; set and empty turns it off |
 
@@ -225,7 +227,8 @@ Two failures that look alike in the log and must never be handled alike:
   pauses that partition, waits, resumes it, and repeats the SAME message: the offset does not
   advance, order is kept, nothing is dropped or piled up in memory. Lag grows, and that is correct:
   the instruction waits. The limiter is the token bucket from wallet-go, reused (not a
-  contribution of this project).
+  contribution of this project). With 4 parallel workers the participant still sees zero `429`:
+  `Reserve` hands each caller a distinct future slot, so waiters do not compete for one token.
 - **The in-flight limit is not the rate limit.** `OUTPUT_TPS` caps sends per second;
   `PARTICIPANT_LIMIT_MAX` caps sends at the same time, and the participant never tells either
   number, so the second one is discovered (AIMD): a conclusive answer adds `1/limit`, and a `429`
@@ -236,7 +239,16 @@ Two failures that look alike in the log and must never be handled alike:
   lowers the limit and still never resends. The HTTP transport cannot follow the limit
   (`MaxConnsPerHost` cannot change once in use), so it is sized at the ceiling and idle
   connections are closed every time the limit drops. Off by default; it only has something to
-  limit once the processor sends in parallel (session 19b).
+  limit when `PROCESSOR_WORKERS_MAX` is above 1.
+- **The worker pool never reorders an aggregate.** Each record becomes a task of `elastic.Pool`
+  (stream = partition, key = `aggregate_id`), so two messages of the same aggregate never run at
+  the same time or out of order, while different aggregates run in parallel. The retry of a
+  transient error stays inside the task, holding the key. The offset is committed in batches
+  (every 100 ms) only up to the contiguous watermark: a task cut short by shutdown marks itself
+  incomplete and the commit never passes it, and a message without headers becomes an empty task
+  so it cannot stall the watermark. Backpressure still pauses the partition, now counted: it is
+  resumed only when the last waiting task ends. More workers than the in-flight limit just wait
+  for a slot, writing nothing. The pool never resends anything.
 - **The input limit protects the API.** With `API_RATE_RPS` set, each authenticated client gets
   its own bucket on `POST /instructions` and `GET /instructions/{id}`; over the limit it gets
   `429 rate_limited` with `Retry-After`, and the use case does not run. This `429` (API to
@@ -262,6 +274,8 @@ asynchronous, and every label is a closed set (never an `aggregate_id` or `instr
 | `payrouter_routing_outcomes_total{outcome}` | what each send turned into: settled, rejected, throttled, unknown |
 | `payrouter_output_backpressure_*`, `payrouter_consumer_*` | how long the output limit held the queue, partition pauses, consumer results |
 | `payrouter_reconciliation_*` | queries by result (watch `exhausted`, which needs a human) and the pending task backlog |
+| `payrouter_pool_workers`, `..._target_workers`, `..._ready_tasks`, `..._pending_tasks`, `..._running_tasks` | the worker pool read at scrape: live workers, desired size, and tasks ready, accepted-and-unfinished, and running |
+| `payrouter_pool_resizes_total{direction}`, `payrouter_consumer_commits_total{result}` | pool resizes (`up`/`down`) and offset commits (`ok`/`error`; an error means redelivery) |
 | `payrouter_participant_limit`, `..._inflight`, `..._limit_waiting`, `..._limit_changes_total{direction}` | the adaptive in-flight limit: where it is, how much of it is used, who waits for a slot, and each step up or down (absent when the limit is off) |
 | `payrouter_outbox_pending`, `..._oldest_pending_age_seconds` | relay lag at the source |
 | `payrouter_http_*{route,status}` | API traffic by route pattern; `429` and `504` side by side |
@@ -364,14 +378,18 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 - An instruction can still stay `in_flight` forever if the processor dies between claiming and
   sending, or if even the `unknown` record cannot be written.
 - There is no dead-letter queue: a message without the expected headers is logged and skipped.
-- The processor still handles one message at a time. `internal/elastic.Pool` (key affinity,
-  contiguous watermark, hysteresis sizing) exists and is tested, but the consumer does not use it
-  yet (session 19b), so a partition waiting on the output limit also delays the others read by the
-  same consumer, and the in-flight limit has little to limit: there is one send at a time.
+- There is no handling of partition revoke (rebalance). After a revoke the old owner's tasks may
+  still finish and its commit is rejected; the new owner redelivers, which is safe because the
+  claim is an append with an expected version. A partition re-assigned to the same instance may
+  regress its commit once: only more redelivery, never loss.
+- Offsets are committed every 100 ms, so up to that much finished work can be redelivered after a
+  crash (safe, idempotent by version).
+- A stuck head of a partition (a transient error retrying forever) lets the next messages finish
+  but not commit; at 1024 uncommitted messages in one partition the whole consumer stops reading
+  until the head completes.
+- A panic inside a pool task is not recovered and takes the process down.
 - The AIMD constants (halve on `429`/timeout, add `1/limit` on success) and the pool thresholds are
   a first guess, not tuned; experiment 7.4 is where they get measured.
-- The output limiter lets several waiting callers wake together and compete for one token; fine
-  for a sequential consumer, to revisit when the elastic pool processes in parallel.
 - A message the processor skips (repeated or stale) still spends one output token.
 - The input limiter keeps one bucket per client forever (clients are registered by an admin, so
   the set is small); expire idle buckets if registration is ever opened.
