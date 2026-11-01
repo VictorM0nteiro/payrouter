@@ -80,6 +80,8 @@ type Processor struct {
 	records          *prometheus.CounterVec
 	pauses           prometheus.Counter
 	limitChanges     *prometheus.CounterVec
+	commits          *prometheus.CounterVec
+	poolResizes      *prometheus.CounterVec
 }
 
 // NewProcessor cria e registra as métricas do processor em reg.
@@ -122,9 +124,60 @@ func NewProcessor(reg *prometheus.Registry) *Processor {
 			Namespace: namespace, Name: "participant_limit_changes_total",
 			Help: "Mudanças do limite adaptativo de requisições em voo, por direção: up ou down.",
 		}, []string{"direction"}),
+		commits: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "consumer_commits_total",
+			Help: "Commits de offset do consumidor, por resultado: ok ou error (as mensagens serão repetidas).",
+		}, []string{"result"}),
+		poolResizes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "pool_resizes_total",
+			Help: "Mudanças do tamanho desejado do pool de workers, por direção: up ou down.",
+		}, []string{"direction"}),
 	}
-	reg.MustRegister(m.calls, m.callDuration, m.outcomes, m.backpressure, m.backpressureWait, m.reconciled, m.records, m.pauses, m.limitChanges)
+	reg.MustRegister(m.calls, m.callDuration, m.outcomes, m.backpressure, m.backpressureWait, m.reconciled, m.records, m.pauses,
+		m.limitChanges, m.commits, m.poolResizes)
 	return m
+}
+
+// Commit registra um commit de offset do consumidor: "ok" ou "error".
+func (m *Processor) Commit(result string) {
+	if m == nil {
+		return
+	}
+	m.commits.WithLabelValues(result).Inc()
+}
+
+// PoolResized registra uma mudança do tamanho desejado do pool de workers.
+func (m *Processor) PoolResized(from, to int) {
+	if m == nil {
+		return
+	}
+	direction := "up"
+	if to < from {
+		direction = "down"
+	}
+	m.poolResizes.WithLabelValues(direction).Inc()
+}
+
+// RegisterPool expõe o estado do pool de workers, lido na hora do scrape: workers vivos, o
+// tamanho desejado e as tarefas prontas, pendentes e rodando.
+func RegisterPool(reg *prometheus.Registry, stats func() (size, target, ready, pending, running int)) {
+	gauge := func(name, help string, pick func(size, target, ready, pending, running int) int) prometheus.GaugeFunc {
+		return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: namespace, Name: name, Help: help}, func() float64 {
+			return float64(pick(stats()))
+		})
+	}
+	reg.MustRegister(
+		gauge("pool_workers", "Workers vivos do pool.",
+			func(size, _, _, _, _ int) int { return size }),
+		gauge("pool_target_workers", "Tamanho desejado do pool.",
+			func(_, target, _, _, _ int) int { return target }),
+		gauge("pool_ready_tasks", "Tarefas prontas que ainda não começaram.",
+			func(_, _, ready, _, _ int) int { return ready }),
+		gauge("pool_pending_tasks", "Tarefas aceitas e não concluídas (esperando, prontas ou rodando).",
+			func(_, _, _, pending, _ int) int { return pending }),
+		gauge("pool_running_tasks", "Tarefas rodando agora.",
+			func(_, _, _, _, running int) int { return running }),
+	)
 }
 
 // LimitChanged registra uma mudança do limite adaptativo de requisições em voo.

@@ -82,7 +82,7 @@ func TestMesmoAgregadoCaiNaMesmaParticaoEmOrdem(t *testing.T) {
 	var batch []app.OutboxMessage
 	for v := 1; v <= 5; v++ {
 		for _, agg := range []string{"agg-a", "agg-b", "agg-c", "agg-d"} {
-			batch = append(batch, app.OutboxMessage{AggregateID: agg, Topic: topic, EventType: "E", Version: v, Payload: []byte(fmt.Sprintf(`{"v":%d}`, v))})
+			batch = append(batch, app.OutboxMessage{AggregateID: agg, Topic: topic, EventType: "E", Version: v, Payload: fmt.Appendf(nil, `{"v":%d}`, v)})
 		}
 	}
 	if err := p.Publish(context.Background(), batch); err != nil {

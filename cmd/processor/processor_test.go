@@ -469,6 +469,7 @@ func TestPontaAPontaDosComportamentos(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer consumer.Close()
+	consumer.WithWorkers(testWorkers)
 	client := pclient.NewClient(srv.URL, 500*time.Millisecond)
 	uc := app.NewProcessInstruction(postgres.NewUnitOfWork(testPool), client, 200*time.Millisecond)
 	reconciler := app.NewReconcile(postgres.NewUnitOfWork(testPool), client, app.ReconcileConfig{

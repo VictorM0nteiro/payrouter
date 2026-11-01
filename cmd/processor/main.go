@@ -2,7 +2,8 @@
 // Ponto de entrada do processo processor: lê a configuração do ambiente (DATABASE_URL,
 // KAFKA_BROKERS, PARTICIPANT_URL, PARTICIPANT_TIMEOUT, RECONCILE_FIRST_DELAY, RECONCILE_BATCH, RECONCILE_POLL, RECONCILE_LEASE,
 // RECONCILE_BACKOFF_BASE, RECONCILE_BACKOFF_MAX,  RECONCILE_MAX_ATTEMPTS, OUTPUT_TPS, OUTPUT_BURST,
-// PARTICIPANT_LIMIT_MAX, PARTICIPANT_LIMIT_MIN, PARTICIPANT_LIMIT_INIT, PARTICIPANT_IDLE_TTL, KAFKA_GROUP, METRICS_ADDR, LOG_FORMAT), liga o
+// PARTICIPANT_LIMIT_MAX, PARTICIPANT_LIMIT_MIN, PARTICIPANT_LIMIT_INIT, PARTICIPANT_IDLE_TTL,
+// PROCESSOR_WORKERS_MIN, PROCESSOR_WORKERS_MAX, PROCESSOR_QUEUE, KAFKA_GROUP, METRICS_ADDR, LOG_FORMAT), liga o
 // consumidor Kafka ao caso de uso e roda até receber SIGINT/SIGTERM.
 // Objetivo: ser a composition root do processor, o lado do comando que produz o efeito
 // colateral (enviar ao participante). No desligamento termina a mensagem em andamento antes
@@ -47,6 +48,7 @@ const (
 	defaultBackoffMax  = time.Minute
 	defaultMaxAttempts = 10
 	defaultIdleTTL     = 30 * time.Second
+	defaultQueue       = 64
 	connectTimeout     = 5 * time.Second
 	maxConnLifetime    = 30 * time.Minute
 	healthCheckPeriod  = 30 * time.Second
@@ -107,6 +109,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	workers, err := workersConfig()
+	if err != nil {
+		return err
+	}
 	group := os.Getenv("KAFKA_GROUP")
 	if group == "" {
 		group = defaultGroup
@@ -161,7 +167,11 @@ func run() error {
 	metrics.RegisterBacklog(reg, postgres.NewBacklogReader(pool).Read)
 	useCase.WithMetrics(pm)
 	reconciler.WithMetrics(pm)
-	consumer.WithMetrics(pm)
+	consumer.WithMetrics(pm).WithWorkers(workers)
+	metrics.RegisterPool(reg, func() (int, int, int, int, int) {
+		s := consumer.PoolStats()
+		return s.Size, s.Target, s.Ready, s.Pending, s.Running
+	})
 	if limit.Max > 0 {
 		// O Transport é dimensionado para o teto; a cada queda do limite as conexões ociosas fecham.
 		limit.OnChange = func(from, to int) {
@@ -184,7 +194,8 @@ func run() error {
 		"reconcile_poll", reconcile.Poll.String(), "reconcile_backoff_base", reconcile.BackoffBase.String(),
 		"reconcile_backoff_max", reconcile.BackoffMax.String(), "reconcile_max_attempts", reconcile.MaxAttempts,
 		"output_tps", outputTPS, "output_burst", outputBurst, "limit_min", limit.Min, "limit_max", limit.Max,
-		"limit_init", limit.Initial, "idle_ttl", idleTTL.String(), "metrics_addr", metricsAddr)
+		"limit_init", limit.Initial, "idle_ttl", idleTTL.String(), "workers_min", workers.Min, "workers_max", workers.Max,
+		"queue", workers.Queue, "metrics_addr", metricsAddr)
 
 	// A conciliação roda ao lado do consumidor; os dois param com o mesmo sinal.
 	var wg sync.WaitGroup
@@ -254,6 +265,26 @@ func limiterConfig() (elastic.LimiterConfig, error) {
 	}
 	if cfg.Max > 0 && (cfg.Min > cfg.Max || cfg.Initial < cfg.Min || cfg.Initial > cfg.Max) {
 		return cfg, fmt.Errorf("PARTICIPANT_LIMIT: é preciso MIN (%d) <= INIT (%d) <= MAX (%d)", cfg.Min, cfg.Initial, cfg.Max)
+	}
+	return cfg, nil
+}
+
+// workersConfig lê o tamanho do pool de workers do consumidor. PROCESSOR_WORKERS_MAX ausente vale
+// o piso (pool fixo); com 1 e 1 o processor se comporta como antes, uma mensagem por vez.
+func workersConfig() (elastic.Config, error) {
+	var cfg elastic.Config
+	var err error
+	if cfg.Min, err = intFromEnv("PROCESSOR_WORKERS_MIN", 1); err != nil {
+		return cfg, err
+	}
+	if cfg.Max, err = intFromEnv("PROCESSOR_WORKERS_MAX", cfg.Min); err != nil {
+		return cfg, err
+	}
+	if cfg.Queue, err = intFromEnv("PROCESSOR_QUEUE", defaultQueue); err != nil {
+		return cfg, err
+	}
+	if cfg.Max < cfg.Min {
+		return cfg, fmt.Errorf("PROCESSOR_WORKERS_MAX (%d) menor que PROCESSOR_WORKERS_MIN (%d)", cfg.Max, cfg.Min)
 	}
 	return cfg, nil
 }

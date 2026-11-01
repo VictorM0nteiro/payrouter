@@ -98,11 +98,14 @@ func pipelineWith(t *testing.T, participantURL string, ids []domain.InstructionI
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumer.WithMetrics(pm)
+	consumer.WithMetrics(pm).WithWorkers(testWorkers)
 	client := pclient.NewClient(participantURL, 2*time.Second)
 	uc := app.NewProcessInstruction(postgres.NewUnitOfWork(testPool), client, 200*time.Millisecond).WithMetrics(pm)
 	if limiter != nil {
 		uc.WithLimiter(limiter)
+	}
+	if testConcurrency != nil {
+		uc.WithConcurrency(testConcurrency)
 	}
 	reconciler := app.NewReconcile(postgres.NewUnitOfWork(testPool), client, app.ReconcileConfig{
 		Batch: 10, Lease: 30 * time.Second, Poll: 100 * time.Millisecond,
