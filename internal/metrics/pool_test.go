@@ -63,4 +63,21 @@ func TestPoolResizedECommitComReceptorNuloNaoFazemNada(t *testing.T) {
 
 	m.PoolResized(1, 4) // não podem entrar em pânico
 	m.Commit("ok")
+	m.Rebalance("revoked")
+}
+
+func TestRebalancesSaoContadosPorEvento(t *testing.T) {
+	reg := NewRegistry()
+	m := NewProcessor(reg)
+
+	m.Rebalance("assigned")
+	m.Rebalance("revoked")
+	m.Rebalance("revoked")
+	m.Rebalance("lost")
+
+	for event, want := range map[string]float64{"assigned": 1, "revoked": 2, "lost": 1} {
+		if got := value(t, reg, "payrouter_consumer_rebalances_total", map[string]string{"event": event}); got != want {
+			t.Errorf("rebalances{%s} = %v, esperado %v", event, got, want)
+		}
+	}
 }

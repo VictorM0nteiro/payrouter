@@ -361,12 +361,11 @@ func TestDesligamentoNaoTrataAFilaESoConfirmaOPrefixoConcluido(t *testing.T) {
 	}
 }
 
-func TestCabecaPresaLimitaOQueFicaSemConfirmarEDestravaQuandoConclui(t *testing.T) {
+func TestCabecaPresaPausaALeituraDaParticaoEDestravaQuandoConclui(t *testing.T) {
 	topic := newTopic(t, 1)
 	publish(t, topic, "agg-w0", 1) // a cabeça
-	for i := 1; i <= 8; i++ {
-		publish(t, topic, fmt.Sprintf("agg-w%d", i), 1)
-	}
+	publish(t, topic, "agg-w1", 1)
+	publish(t, topic, "agg-w2", 1)
 
 	release := make(chan struct{})
 	var done seen
@@ -379,12 +378,17 @@ func TestCabecaPresaLimitaOQueFicaSemConfirmarEDestravaQuandoConclui(t *testing.
 	}, func(c *Consumer) { c.window = 3 })
 	defer stop()
 
-	// Com a cabeça presa e janela 3, só a cabeça e mais duas são submetidas: espera as duas
-	// concluírem e confere que, passado um tempo, nenhuma outra entrou.
+	// Cabeça presa + duas concluídas = 3 não confirmadas = a janela. A próxima a chegar (w3) ainda é
+	// submetida, mas faz a leitura da partição pausar: o que for publicado depois não é lido.
 	waitFor(t, "as duas depois da cabeça", func() bool { return len(done.all()) >= 2 })
+	publish(t, topic, "agg-w3", 1)
+	waitFor(t, "a que chega com a janela cheia", func() bool { return len(done.all()) >= 3 })
+	for i := 4; i <= 8; i++ {
+		publish(t, topic, fmt.Sprintf("agg-w%d", i), 1)
+	}
 	time.Sleep(time.Second)
-	if got := len(done.all()); got != 2 {
-		t.Errorf("concluídas com a cabeça presa = %d, esperado 2 (a janela de 3 inclui a cabeça)", got)
+	if got := len(done.all()); got != 3 {
+		t.Errorf("concluídas com a cabeça presa = %d, esperado 3: a leitura da partição devia estar pausada", got)
 	}
 
 	close(release)
