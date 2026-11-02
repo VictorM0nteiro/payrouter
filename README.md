@@ -249,6 +249,12 @@ Two failures that look alike in the log and must never be handled alike:
   so it cannot stall the watermark. Backpressure still pauses the partition, now counted: it is
   resumed only when the last waiting task ends. More workers than the in-flight limit just wait
   for a slot, writing nothing. The pool never resends anything.
+- **A rebalance never lets two consumers hold the same aggregate.** When the group takes a
+  partition away, the revoke callback stops the tasks of that partition that have not started,
+  waits for those already inside the handler (up to 20 s), commits what the watermark allows and
+  forgets the partition; only then can the new owner read it. A lost partition (fatal group
+  error) is forgotten without a commit. A partition with too many uncommitted messages (a stuck
+  head, 1024 by default) pauses only its own fetch; the other partitions keep flowing.
 - **The input limit protects the API.** With `API_RATE_RPS` set, each authenticated client gets
   its own bucket on `POST /instructions` and `GET /instructions/{id}`; over the limit it gets
   `429 rate_limited` with `Retry-After`, and the use case does not run. This `429` (API to
@@ -276,6 +282,7 @@ asynchronous, and every label is a closed set (never an `aggregate_id` or `instr
 | `payrouter_reconciliation_*` | queries by result (watch `exhausted`, which needs a human) and the pending task backlog |
 | `payrouter_pool_workers`, `..._target_workers`, `..._ready_tasks`, `..._pending_tasks`, `..._running_tasks` | the worker pool read at scrape: live workers, desired size, and tasks ready, accepted-and-unfinished, and running |
 | `payrouter_pool_resizes_total{direction}`, `payrouter_consumer_commits_total{result}` | pool resizes (`up`/`down`) and offset commits (`ok`/`error`; an error means redelivery) |
+| `payrouter_consumer_rebalances_total{event}` | group rebalance callbacks: `assigned`, `revoked` (drained and committed first) and `lost` (forgotten without a commit) |
 | `payrouter_participant_limit`, `..._inflight`, `..._limit_waiting`, `..._limit_changes_total{direction}` | the adaptive in-flight limit: where it is, how much of it is used, who waits for a slot, and each step up or down (absent when the limit is off) |
 | `payrouter_outbox_pending`, `..._oldest_pending_age_seconds` | relay lag at the source |
 | `payrouter_http_*{route,status}` | API traffic by route pattern; `429` and `504` side by side |
@@ -378,16 +385,19 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 - An instruction can still stay `in_flight` forever if the processor dies between claiming and
   sending, or if even the `unknown` record cannot be written.
 - There is no dead-letter queue: a message without the expected headers is logged and skipped.
-- There is no handling of partition revoke (rebalance). After a revoke the old owner's tasks may
-  still finish and its commit is rejected; the new owner redelivers, which is safe because the
-  claim is an append with an expected version. A partition re-assigned to the same instance may
-  regress its commit once: only more redelivery, never loss.
+- After a rebalance the new owner repeats some messages the old one already handled: the commit
+  watermark is contiguous and stops at the first task dropped on revoke, so what other keys
+  finished after it is redelivered (about 40 messages in the two-consumer test, bounded by the
+  pool queue). Safe, because the claim is an append with an expected version, but not free.
+- The revoke callback waits at most 20 s for tasks already inside the handler (the group allows
+  60 s); a slower task is cut and its message goes to the new owner. Records of a revoked
+  partition that were already fetched may still be submitted once more; also safe, also repeated.
 - Offsets are committed every 100 ms, so up to that much finished work can be redelivered after a
   crash (safe, idempotent by version).
-- A stuck head of a partition (a transient error retrying forever) lets the next messages finish
-  but not commit; at 1024 uncommitted messages in one partition the whole consumer stops reading
-  until the head completes.
-- A panic inside a pool task is not recovered and takes the process down.
+- The uncommitted limit (1024 per partition) is soft: the batch already in hand can pass it a
+  little before the partition's fetch pauses.
+- A panic inside a pool task is not recovered and takes the process down on purpose: the offset
+  never passed that task, so the restart redelivers it, idempotently by version.
 - The AIMD constants (halve on `429`/timeout, add `1/limit` on success) and the pool thresholds are
   a first guess, not tuned; experiment 7.4 is where they get measured.
 - A message the processor skips (repeated or stale) still spends one output token.

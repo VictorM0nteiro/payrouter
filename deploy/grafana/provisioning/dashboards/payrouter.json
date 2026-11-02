@@ -1193,6 +1193,52 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "Group rebalances, by event",
+      "id": 34,
+      "description": "Rebalance callbacks per minute: assigned, revoked (the partition is drained and its offset committed before it moves) or lost (fatal group error, forgotten without a commit). A revoke should be followed by redelivery, never by a lost message.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (event) (increase(payrouter_consumer_rebalances_total[1m]))",
+          "legendFormat": "{{event}}"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Redpanda and processes",
       "id": 25,
@@ -1201,7 +1247,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 105
+        "y": 113
       },
       "panels": []
     },
@@ -1218,7 +1264,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 106
+        "y": 114
       },
       "fieldConfig": {
         "defaults": {
@@ -1273,7 +1319,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 106
+        "y": 114
       },
       "fieldConfig": {
         "defaults": {
