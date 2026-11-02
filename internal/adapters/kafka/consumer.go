@@ -15,6 +15,15 @@
 //
 // Uma tarefa que o desligamento interrompe NÃO terminou, mesmo que o pool a dê por concluída: ela
 // se marca como incompleta e a confirmação nunca passa dela.
+//
+// Rebalance: quando o grupo tira uma partição, o callback de revoke impede que as tarefas dela que
+// ainda não começaram sejam tratadas (época nova), espera as que estão dentro do handler terminarem
+// (com prazo), confirma o que a marca d'água permite e esquece a partição; assim o novo dono começa
+// do offset confirmado e o que ficou para trás é reentregue (seguro: o claim é um append com versão
+// esperada). Partição perdida (erro fatal do grupo) é esquecida sem commit.
+//
+// Uma partição com mensagens demais sem confirmar (uma cabeça presa) tem só a SUA leitura pausada;
+// as outras seguem. O lote já em mãos pode passar um pouco do limite.
 
 package kafka
 
@@ -48,11 +57,15 @@ const (
 	// closeGrace é quanto o desligamento espera as tarefas em andamento terminarem.
 	closeGrace = handleTimeout + 5*time.Second
 
-	// maxUncommitted limita, por partição, as mensagens submetidas e ainda não confirmadas. A fila do
-	// pool só conta as que não começaram; sem este limite, uma cabeça de partição presa deixaria as
-	// seguintes concluírem e se acumularem em memória sem fim.
-	// shortcut: uma cabeça presa acaba parando o consumidor inteiro neste limite; a evolução é
-	// pausar só a partição presa.
+	// revokeDrain é quanto o callback de revoke espera as tarefas em andamento da partição. Fica bem
+	// abaixo do prazo de rebalance do grupo (60 s): passar dele tiraria este membro do grupo.
+	// shortcut: prazo fixo; uma tarefa mais lenta que ele é cortada e a mensagem vai ao novo dono,
+	// que a repete (seguro). Tornar configurável se o handler ficar mais lento.
+	revokeDrain = 20 * time.Second
+
+	// maxUncommitted é, por partição, quantas mensagens submetidas e ainda não confirmadas fazem a
+	// leitura DELA pausar. A fila do pool só conta as que não começaram; sem este limite, uma cabeça
+	// de partição presa deixaria as seguintes concluírem e se acumularem em memória sem fim.
 	maxUncommitted = 1024
 )
 
@@ -62,28 +75,41 @@ type Handler func(ctx context.Context, msg app.Message) error
 // partition é o estado de uma partição: o que foi submetido ao pool e ainda não foi confirmado.
 // Protegido por Consumer.mu.
 type partition struct {
+	id   int32
 	next uint64                 // sequência que o próximo Submit recebe (o pool numera 0, 1, 2...)
 	base uint64                 // primeira sequência ainda não confirmada
 	recs map[uint64]*kgo.Record // sequência -> registro, de base até next-1
 
-	incomplete    uint64 // primeira sequência cortada pelo desligamento
+	incomplete    uint64 // primeira sequência cortada pelo desligamento ou pelo revoke
 	hasIncomplete bool
 	target        uint64 // maior sequência que já pode ser confirmada
 	hasTarget     bool
-	pauses        int // esperas de contrapressão em andamento nesta partição
+
+	pauses       int  // esperas de contrapressão e do limite de não confirmadas que pausam a partição
+	windowPaused bool // a leitura está pausada por excesso de não confirmadas (conta uma vez em pauses)
+
+	epoch    uint64 // sobe a cada revoke/lost; tarefa de época antiga não é tratada
+	inflight int    // tarefas dentro do handler agora
 }
 
 // Consumer lê um tópico em grupo.
 type Consumer struct {
 	client  *kgo.Client
+	topic   string
 	metrics *metrics.Processor // nil = sem métricas
 	workers elastic.Config
-	window  uint64 // mensagens não confirmadas por partição antes de o consumo parar
+	window  uint64        // mensagens não confirmadas por partição antes de a leitura dela pausar
+	drain   time.Duration // prazo do callback de revoke para as tarefas em andamento
+
+	// afterRevoke, se definido (testes), roda ao fim de cada revoke com as partições e quantas
+	// tarefas ainda estavam dentro do handler quando o prazo acabou (0 = esperou todas).
+	afterRevoke func(parts []int32, stillRunning int)
 
 	pool atomic.Pointer[elastic.Pool[string]]
 
-	mu    sync.Mutex
-	parts map[int32]*partition
+	commitMu sync.Mutex // serializa os commits e o esquecimento de partições
+	mu       sync.Mutex
+	parts    map[int32]*partition
 }
 
 // WithMetrics liga as métricas do consumidor. Sem elas, nada é medido.
@@ -110,22 +136,28 @@ func (c *Consumer) PoolStats() elastic.Stats {
 // NewConsumer entra no grupo para ler o tópico. Sem offset salvo, começa do início, para
 // nada que já esteja no tópico ser perdido.
 func NewConsumer(brokers []string, group, topic string) (*Consumer, error) {
+	c := &Consumer{
+		topic:   topic,
+		workers: elastic.Config{Min: 1, Max: 1},
+		window:  maxUncommitted,
+		drain:   revokeDrain,
+		parts:   make(map[int32]*partition),
+	}
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.DisableAutoCommit(),
+		kgo.OnPartitionsAssigned(c.assigned),
+		kgo.OnPartitionsRevoked(c.revoked),
+		kgo.OnPartitionsLost(c.lost),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("criando consumidor Kafka: %w", err)
 	}
-	return &Consumer{
-		client:  client,
-		workers: elastic.Config{Min: 1, Max: 1},
-		window:  maxUncommitted,
-		parts:   make(map[int32]*partition),
-	}, nil
+	c.client = client
+	return c, nil
 }
 
 // Run consome até o contexto terminar. As mensagens em andamento são concluídas antes de sair; as
@@ -169,19 +201,21 @@ func (c *Consumer) Run(ctx context.Context, handle Handler) error {
 	return nil
 }
 
-// submit entrega o registro ao pool. Bloqueia se a fila está cheia ou se a partição tem mensagens
-// demais sem confirmar; volta sem submeter se o contexto terminar.
+// submit entrega o registro ao pool. Bloqueia se a fila está cheia; se a partição tem mensagens
+// demais sem confirmar, pausa a leitura dela (as outras seguem); volta sem submeter se o contexto
+// terminar.
 func (c *Consumer) submit(ctx context.Context, pool *elastic.Pool[string], handle Handler, r *kgo.Record) {
 	p := c.partition(r.Partition)
-	if !c.waitWindow(ctx, p) {
-		return
-	}
 	msg, msgErr := toMessage(r)
 
 	// O registro entra no mapa ANTES do Submit: a tarefa pode terminar, e a marca d'água chegar,
 	// antes de o Submit voltar. Submit é serial por partição, então a sequência é exata.
 	c.mu.Lock()
-	seq := p.next
+	if p.next-p.base >= c.window && !p.windowPaused {
+		p.windowPaused = true
+		c.holdPause(p)
+	}
+	seq, epoch := p.next, p.epoch
 	p.recs[seq] = r
 	c.mu.Unlock()
 
@@ -191,7 +225,12 @@ func (c *Consumer) submit(ctx context.Context, pool *elastic.Pool[string], handl
 			c.metrics.Record("invalid")
 			return
 		}
-		if ctx.Err() != nil || !c.process(ctx, p, handle, msg, r) {
+		if !c.begin(p, epoch) { // a partição foi revogada depois de submetida: não é mais nossa
+			c.markIncomplete(p, seq)
+			return
+		}
+		defer c.end(p)
+		if ctx.Err() != nil || !c.process(ctx, p, epoch, handle, msg, r) {
 			c.markIncomplete(p, seq)
 		}
 	}}
@@ -206,40 +245,65 @@ func (c *Consumer) submit(ctx context.Context, pool *elastic.Pool[string], handl
 	c.mu.Unlock()
 }
 
-// waitWindow espera a partição ter menos de c.window mensagens sem confirmar. Devolve false se o
-// contexto terminou antes.
-func (c *Consumer) waitWindow(ctx context.Context, p *partition) bool {
-	for {
-		c.mu.Lock()
-		open := p.next-p.base < uint64(c.window)
-		c.mu.Unlock()
-		if open {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-}
-
 func (c *Consumer) partition(id int32) *partition {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	p := c.parts[id]
 	if p == nil {
-		p = &partition{recs: make(map[uint64]*kgo.Record)}
+		p = &partition{id: id, recs: make(map[uint64]*kgo.Record)}
 		c.parts[id] = p
 	}
 	return p
 }
 
+// begin marca a tarefa como dentro do handler. Falso se a partição mudou de época (revoke).
+func (c *Consumer) begin(p *partition, epoch uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p.epoch != epoch {
+		return false
+	}
+	p.inflight++
+	return true
+}
+
+func (c *Consumer) end(p *partition) {
+	c.mu.Lock()
+	p.inflight--
+	c.mu.Unlock()
+}
+
+func (c *Consumer) stale(p *partition, epoch uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return p.epoch != epoch
+}
+
+// holdPause e releasePause contam quem precisa da partição pausada; o cliente só é chamado nas
+// bordas (0 -> 1 pausa, 1 -> 0 retoma). Chamar com c.mu preso.
+func (c *Consumer) holdPause(p *partition) {
+	p.pauses++
+	if p.pauses == 1 {
+		c.client.PauseFetchPartitions(map[string][]int32{c.topic: {p.id}})
+	}
+}
+
+func (c *Consumer) releasePause(p *partition) {
+	p.pauses--
+	if p.pauses == 0 {
+		c.client.ResumeFetchPartitions(map[string][]int32{c.topic: {p.id}})
+	}
+}
+
 // markIncomplete anota que a tarefa seq não terminou. Roda antes de a tarefa voltar ao pool, então
-// antes de a marca d'água poder passar por ela.
+// antes de a marca d'água poder passar por ela. Uma sequência abaixo de base já foi esquecida
+// (revoke) e não conta.
 func (c *Consumer) markIncomplete(p *partition, seq uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if seq < p.base {
+		return
+	}
 	if !p.hasIncomplete || seq < p.incomplete {
 		p.incomplete, p.hasIncomplete = seq, true
 	}
@@ -281,8 +345,14 @@ func (c *Consumer) committer(stop <-chan struct{}, done chan<- struct{}) {
 	}
 }
 
-// commit confirma, de uma vez, o maior registro confirmável de cada partição.
 func (c *Consumer) commit() {
+	c.commitMu.Lock()
+	defer c.commitMu.Unlock()
+	c.commitLocked()
+}
+
+// commitLocked confirma, de uma vez, o maior registro confirmável de cada partição. Com commitMu preso.
+func (c *Consumer) commitLocked() {
 	type pending struct {
 		p    *partition
 		upTo uint64
@@ -293,8 +363,11 @@ func (c *Consumer) commit() {
 	)
 	c.mu.Lock()
 	for _, p := range c.parts {
-		if p.hasTarget && p.target >= p.base {
-			rs = append(rs, p.recs[p.target])
+		if !p.hasTarget || p.target < p.base {
+			continue
+		}
+		if rec := p.recs[p.target]; rec != nil {
+			rs = append(rs, rec)
 			sent = append(sent, pending{p, p.target})
 		}
 	}
@@ -316,16 +389,118 @@ func (c *Consumer) commit() {
 		for seq := s.p.base; seq <= s.upTo; seq++ {
 			delete(s.p.recs, seq)
 		}
-		s.p.base = s.upTo + 1
+		if s.upTo+1 > s.p.base {
+			s.p.base = s.upTo + 1
+		}
+		if s.p.windowPaused && s.p.next-s.p.base < c.window {
+			s.p.windowPaused = false
+			c.releasePause(s.p)
+		}
 	}
 	c.mu.Unlock()
 }
 
+// assigned só conta o evento: a partição nova começa vazia e o pool numera a partir de onde estava.
+func (c *Consumer) assigned(_ context.Context, _ *kgo.Client, m map[string][]int32) {
+	if len(m[c.topic]) > 0 {
+		c.metrics.Rebalance("assigned")
+	}
+}
+
+// revoked é o callback de revoke do grupo. Ver o comentário do arquivo.
+func (c *Consumer) revoked(_ context.Context, _ *kgo.Client, m map[string][]int32) {
+	ids := m[c.topic]
+	if len(ids) == 0 {
+		return
+	}
+	c.bumpEpoch(ids)
+	running := c.waitIdle(ids)
+	if running > 0 {
+		slog.Warn("consumer: partição revogada com tarefas ainda no handler; serão repetidas pelo novo dono",
+			"partitions", ids, "running", running)
+	}
+	c.commitMu.Lock()
+	c.commitLocked()
+	c.forget(ids)
+	c.commitMu.Unlock()
+	c.metrics.Rebalance("revoked")
+	if c.afterRevoke != nil {
+		c.afterRevoke(ids, running)
+	}
+}
+
+// lost é o callback de partição perdida (erro fatal do grupo): o commit não vai valer, então só esquece.
+func (c *Consumer) lost(_ context.Context, _ *kgo.Client, m map[string][]int32) {
+	ids := m[c.topic]
+	if len(ids) == 0 {
+		return
+	}
+	c.bumpEpoch(ids)
+	c.commitMu.Lock()
+	c.forget(ids)
+	c.commitMu.Unlock()
+	c.metrics.Rebalance("lost")
+}
+
+// bumpEpoch faz as tarefas já submetidas dessas partições deixarem de ser tratadas.
+func (c *Consumer) bumpEpoch(ids []int32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, id := range ids {
+		if p := c.parts[id]; p != nil {
+			p.epoch++
+		}
+	}
+}
+
+// waitIdle espera as tarefas dentro do handler dessas partições terminarem, até c.drain. Devolve
+// quantas ainda estavam rodando.
+func (c *Consumer) waitIdle(ids []int32) int {
+	deadline := time.Now().Add(c.drain)
+	for {
+		c.mu.Lock()
+		running := 0
+		for _, id := range ids {
+			if p := c.parts[id]; p != nil {
+				running += p.inflight
+			}
+		}
+		c.mu.Unlock()
+		if running == 0 || time.Now().After(deadline) {
+			return running
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// forget joga fora o estado de confirmação dessas partições: o que foi confirmado já saiu, o resto
+// volta com quem assumir. Com commitMu preso, para nenhum commit em andamento desfazer isto.
+func (c *Consumer) forget(ids []int32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, id := range ids {
+		p := c.parts[id]
+		if p == nil {
+			continue
+		}
+		p.recs = make(map[uint64]*kgo.Record)
+		p.base = p.next
+		p.hasTarget, p.hasIncomplete = false, false
+		if p.windowPaused {
+			p.windowPaused = false
+			c.releasePause(p)
+		}
+	}
+}
+
 // process devolve true se o registro foi concluído (seu offset pode ser confirmado) e false
-// apenas se o contexto terminou antes de concluí-lo.
-func (c *Consumer) process(ctx context.Context, p *partition, handle Handler, msg app.Message, r *kgo.Record) bool {
+// apenas se o contexto terminou ou a partição foi revogada antes de concluí-lo.
+func (c *Consumer) process(ctx context.Context, p *partition, epoch uint64, handle Handler, msg app.Message, r *kgo.Record) bool {
 	backoff := minRetryBackoff
 	for {
+		if c.stale(p, epoch) {
+			return false
+		}
 		// O handler termina o que começou mesmo durante o desligamento: depois do envio,
 		// abandonar no meio deixaria a instrução sem resposta gravada. O prazo impede que um
 		// banco travado prenda o consumidor para sempre; o estouro é erro transitório.
@@ -345,7 +520,7 @@ func (c *Consumer) process(ctx context.Context, p *partition, handle Handler, ms
 		if errors.As(err, &bp) {
 			c.metrics.Record("backpressure")
 			c.metrics.Pause()
-			if !c.pauseAndWait(ctx, p, r, bp.After) {
+			if !c.pauseAndWait(ctx, p, bp.After) {
 				return false
 			}
 			continue
@@ -362,27 +537,20 @@ func (c *Consumer) process(ctx context.Context, p *partition, handle Handler, ms
 	}
 }
 
-// pauseAndWait pausa a partição do registro, espera d e a retoma. Várias tarefas da mesma partição
-// podem esperar ao mesmo tempo: a partição é pausada pela primeira e só retomada quando a última
-// termina. Devolve false se o contexto terminou antes; a retomada acontece de qualquer forma, para
-// a partição nunca ficar pausada.
-func (c *Consumer) pauseAndWait(ctx context.Context, p *partition, r *kgo.Record, d time.Duration) bool {
-	parts := map[string][]int32{r.Topic: {r.Partition}}
+// pauseAndWait pausa a partição, espera d e a retoma. Várias tarefas da mesma partição podem
+// esperar ao mesmo tempo: a partição é pausada pela primeira e só retomada quando a última termina.
+// Devolve false se o contexto terminou antes; a retomada acontece de qualquer forma, para a
+// partição nunca ficar pausada.
+func (c *Consumer) pauseAndWait(ctx context.Context, p *partition, d time.Duration) bool {
 	c.mu.Lock()
-	p.pauses++
-	if p.pauses == 1 {
-		c.client.PauseFetchPartitions(parts)
-	}
+	c.holdPause(p)
 	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
-		p.pauses--
-		if p.pauses == 0 {
-			c.client.ResumeFetchPartitions(parts)
-		}
+		c.releasePause(p)
 		c.mu.Unlock()
 	}()
-	slog.DebugContext(ctx, "consumer: limite de saída cheio, partição pausada", "partition", r.Partition, "wait", d.String())
+	slog.DebugContext(ctx, "consumer: limite de saída cheio, partição pausada", "partition", p.id, "wait", d.String())
 	select {
 	case <-ctx.Done():
 		return false

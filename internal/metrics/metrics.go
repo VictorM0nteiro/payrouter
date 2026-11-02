@@ -82,6 +82,7 @@ type Processor struct {
 	limitChanges     *prometheus.CounterVec
 	commits          *prometheus.CounterVec
 	poolResizes      *prometheus.CounterVec
+	rebalances       *prometheus.CounterVec
 }
 
 // NewProcessor cria e registra as métricas do processor em reg.
@@ -132,10 +133,22 @@ func NewProcessor(reg *prometheus.Registry) *Processor {
 			Namespace: namespace, Name: "pool_resizes_total",
 			Help: "Mudanças do tamanho desejado do pool de workers, por direção: up ou down.",
 		}, []string{"direction"}),
+		rebalances: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "consumer_rebalances_total",
+			Help: "Callbacks de rebalance do grupo, por evento: assigned, revoked ou lost (partição perdida, sem commit).",
+		}, []string{"event"}),
 	}
 	reg.MustRegister(m.calls, m.callDuration, m.outcomes, m.backpressure, m.backpressureWait, m.reconciled, m.records, m.pauses,
-		m.limitChanges, m.commits, m.poolResizes)
+		m.limitChanges, m.commits, m.poolResizes, m.rebalances)
 	return m
+}
+
+// Rebalance registra um callback de rebalance do grupo: "assigned", "revoked" ou "lost".
+func (m *Processor) Rebalance(event string) {
+	if m == nil {
+		return
+	}
+	m.rebalances.WithLabelValues(event).Inc()
 }
 
 // Commit registra um commit de offset do consumidor: "ok" ou "error".
