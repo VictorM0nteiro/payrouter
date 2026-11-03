@@ -1,5 +1,5 @@
 # Dockerfile
-# Imagem da API, do relay, do processor, do participante simulado e do clientctl do payrouter,
+# Imagem da API, do relay, do processor, do projector, do participante simulado e do clientctl do payrouter,
 # em dois estágios.
 # Objetivo: `docker compose up` conseguir subir a API, o relay, o processor e o participante sem
 # Go instalado na máquina. O primeiro estágio compila os binários estáticos; o segundo é um Alpine mínimo,
@@ -18,12 +18,13 @@ COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/relay ./cmd/relay \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/processor ./cmd/processor \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/projector ./cmd/projector \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/participant ./cmd/participant \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/clientctl ./cmd/clientctl
 
 FROM alpine:3.21
 RUN adduser -D -u 10001 payrouter
-COPY --from=build /out/api /out/relay /out/processor /out/participant /out/clientctl /usr/local/bin/
+COPY --from=build /out/api /out/relay /out/processor /out/projector /out/participant /out/clientctl /usr/local/bin/
 USER payrouter
 EXPOSE 8080
 ENTRYPOINT ["api"]

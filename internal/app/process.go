@@ -120,12 +120,14 @@ type Participant interface {
 	Status(ctx context.Context, id string) (PaymentResult, error)
 }
 
-// Message é o que o processor lê de um registro do Kafka: a chave e os headers, nunca o
-// corpo. Os dados da instrução vêm do event store, que é a fonte autoritativa.
+// Message é o que um consumidor lê de um registro do Kafka: a chave e os headers, mais o corpo
+// em Payload. O processor nunca olha o corpo (os dados da instrução vêm do event store, a fonte
+// autoritativa); o projetor só olha o corpo, para não precisar do Postgres.
 type Message struct {
 	AggregateID string
 	EventType   string
 	Version     int
+	Payload     []byte
 }
 
 // ProcessInstruction é o caso de uso.

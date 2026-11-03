@@ -315,6 +315,31 @@ func (m *Relay) Round(n int, err error, d time.Duration) {
 	m.published.Add(float64(n))
 }
 
+// Projector reúne o que o binário projector mede. Aceita o receptor nulo, como Processor.
+type Projector struct {
+	events *prometheus.CounterVec
+}
+
+// NewProjector cria e registra as métricas do projetor em reg.
+func NewProjector(reg *prometheus.Registry) *Projector {
+	m := &Projector{
+		events: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "projector_events_total",
+			Help: "Eventos que o projetor tratou, por resultado: applied, duplicate (já aplicado), gap (falta um evento anterior, será repetido) ou invalid (descartado).",
+		}, []string{"result"}),
+	}
+	reg.MustRegister(m.events)
+	return m
+}
+
+// Event registra o resultado de um evento projetado.
+func (m *Projector) Event(result string) {
+	if m == nil {
+		return
+	}
+	m.events.WithLabelValues(result).Inc()
+}
+
 // Backlog é o que está esperando no banco neste instante.
 type Backlog struct {
 	ReconciliationTasks int64   // instruções unknown à espera de consulta

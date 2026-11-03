@@ -559,9 +559,9 @@ func (c *Consumer) pauseAndWait(ctx context.Context, p *partition, d time.Durati
 	}
 }
 
-// toMessage extrai chave e headers; o corpo não é lido.
+// toMessage extrai chave e headers e anexa o corpo, que o consumidor não interpreta.
 func toMessage(r *kgo.Record) (app.Message, error) {
-	msg := app.Message{AggregateID: string(r.Key)}
+	msg := app.Message{AggregateID: string(r.Key), Payload: r.Value}
 	if msg.AggregateID == "" {
 		return app.Message{}, errors.New("registro sem chave")
 	}

@@ -149,6 +149,39 @@ services:
     # Termina a mensagem em andamento ao receber SIGTERM; o envio tem prazo próprio.
     stop_grace_period: 15s
 
+  # Banco de leitura: a projeção das instruções (um documento por instrução). Só o projector escreve.
+  mongo:
+    image: mongo:7
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - mongodata:/data/db
+    restart: unless-stopped
+
+  # Projetor: lê o tópico em grupo próprio e mantém o documento de cada instrução no Mongo,
+  # idempotente pela versão. Não fala com o Postgres; pode ser parado e repetido sem perigo.
+  projector:
+    build: .
+    entrypoint: ["projector"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB: payrouter
+      KAFKA_BROKERS: redpanda:9092
+      PROJECTOR_WORKERS_MIN: ${PROJECTOR_WORKERS_MIN:-1}
+      PROJECTOR_WORKERS_MAX: ${PROJECTOR_WORKERS_MAX:-}
+      PROJECTOR_QUEUE: ${PROJECTOR_QUEUE:-64}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    restart: unless-stopped
+    stop_grace_period: 15s
+
   # Participante simulado (a contraparte externa). PARTICIPANT_BEHAVIOR define o padrão
   # (accept, reject, slow, drop, late, crash); um prefixo no end_to_end_id ("late:abc") força o
   # comportamento de uma instrução. O restart devolve o serviço depois de um `crash`.
@@ -212,5 +245,6 @@ services:
 
 volumes:
   pgdata:
+  mongodata:
   prometheus_data:
   grafana_data:

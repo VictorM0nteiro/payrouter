@@ -21,6 +21,10 @@ scrape_configs:
     static_configs:
       - targets: ["processor:9092"]
 
+  - job_name: projector
+    static_configs:
+      - targets: ["projector:9095"]
+
   - job_name: participant
     static_configs:
       - targets: ["participant:9094"]
