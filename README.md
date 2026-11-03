@@ -51,8 +51,9 @@ end-to-end test runs all the participant behaviors through the whole pipeline (s
 instruction returns to `accepted` and is resent; an output rate limit with backpressure keeps it
 from happening, and a per-client input limit protects the API (session 17). Every binary now
 exposes Prometheus metrics, and the compose brings up Prometheus and one Grafana dashboard, so
-the 429-versus-timeout difference is something you can watch (session 17b). There is still no
-projection. The full plan is in
+the 429-versus-timeout difference is something you can watch (session 17b). Phase E has started:
+a projector reads the same topic and keeps one Mongo document per instruction, idempotent by
+version (session 21); the list endpoint, the cache and the replay are still to come. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Up and running in five minutes
@@ -60,7 +61,7 @@ projection. The full plan is in
 Requirements: Docker (with Compose) and `make`. On Windows, use Git Bash or WSL.
 
 ```bash
-make up            # creates .env with a random JWT_SECRET and brings up Postgres, migrations, Redpanda, API, relay, participant, processor, Prometheus and Grafana
+make up            # creates .env with a random JWT_SECRET and brings up Postgres, migrations, Redpanda, Mongo, API, relay, participant, processor, projector, Prometheus and Grafana
 make demo-client   # registers the "demo" client and prints the client_secret (exactly once)
 ```
 
@@ -93,8 +94,8 @@ docker compose exec redpanda rpk topic consume payrouter.instructions.events -n 
 ```
 
 For another client: `make demo-client ID=store-a`. To follow the logs: `make logs` (API),
-`make logs-relay` (relay), `make logs-processor` (processor) and `make logs-participant`
-(participant).
+`make logs-relay` (relay), `make logs-processor` (processor), `make logs-projector` (projector)
+and `make logs-participant` (participant).
 To stop: `make down` (add `-v` to `docker compose down` to delete the database).
 
 ## The simulated participant
@@ -260,8 +261,56 @@ Two failures that look alike in the log and must never be handled alike:
   `429 rate_limited` with `Retry-After`, and the use case does not run. This `429` (API to
   client) is unrelated to the participant's `429`.
 
-## Metrics
+## The projector
 
+The projector is the read side. It exists only because the boundary is asynchronous: the event
+store in Postgres is the source of truth, and Mongo holds a copy shaped for queries, one document
+per instruction (`status`, `amount_cents`, `attempts`, `version`, `updated_at`, and the debtor,
+creditor and `end_to_end_id`). `GET /instructions/{id}` still rebuilds from the event store; only
+the list endpoint planned for session 23 will read the projection, and it is eventually consistent.
+Mongo never decides anything and never triggers a send, so if it goes down routing keeps working and
+only the read side goes stale.
+
+- **The projection is a pure function of the events.** `app.PatchFor` turns a topic record into the
+  fields it changes using only the event type and its data, never the previous state and never
+  Postgres. The table from event to status repeats the domain transitions on purpose, since the
+  projector may not read the aggregate; a test replays real domain histories and requires the same
+  status and attempts as `domain.Rehydrate` after every event, so the two tables cannot drift apart.
+- **Idempotent by version, with no deduplication table.** Version 1 inserts the document and the unique
+  `_id` decides a race between two deliveries. Version v updates only a document that is exactly at
+  version v-1 (the filter is part of the update, so there is no read-then-write). The same event twice
+  changes nothing and does not add an attempt; 16 concurrent deliveries of one version apply once.
+- **An early event waits, it is never dropped.** If the document is behind version v-1 the store says
+  gap, the use case returns `ErrGap` and the consumer repeats the same message in place, the same
+  backpressure the processor uses. Because Kafka partitions by `aggregate_id`, a gap only means an
+  earlier event has not been processed yet.
+- **A bad record cannot stall the group.** Broken JSON, an unknown event type, or a body that disagrees
+  with the key and headers is logged, counted as `invalid` and skipped, so the commit watermark moves on.
+- **Money stays in cents** (`int64`, exact even above 2^53), and the stored time is the event's
+  `occurred_at`, not the clock of the projector, so a rebuild produces the same document.
+
+It reuses the consumer of the processor (worker pool per aggregate, contiguous commit, revoke
+handling) in its own consumer group, so it reads at its own pace and can be stopped and restarted
+without touching the command side. Look at it with:
+
+```bash
+docker compose exec mongo mongosh payrouter --quiet --eval "db.instructions.countDocuments({status:'settled'})"
+docker compose exec postgres psql -U payrouter -d payrouter -tAc "select count(*) from events where event_type='ParticipantAccepted'"
+```
+
+The two numbers converge. To watch it catch up, `docker compose stop projector`, send a burst, then
+`docker compose start projector`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MONGO_URL` | (required) | Mongo connection, `mongodb://mongo:27017` in the compose |
+| `MONGO_DB` | `payrouter` | database that holds the `instructions` collection |
+| `KAFKA_BROKERS` | (required) | brokers, `redpanda:9092` in the compose |
+| `KAFKA_GROUP` | `projector` | consumer group, separate from the processor's |
+| `PROJECTOR_WORKERS_MIN` / `_MAX` / `PROJECTOR_QUEUE` | `1` / MIN / `64` | size of the worker pool and of its bounded queue |
+| `METRICS_ADDR` | `:9095` | where `/metrics` listens; set and empty turns it off |
+
+## Metrics
 `make up` also starts Prometheus and Grafana. Both are bound to localhost only:
 
 | What | Where | Notes |
@@ -270,7 +319,7 @@ Two failures that look alike in the log and must never be handled alike:
 | Prometheus | http://localhost:9099 | scrapes every 5 s; `/targets` shows each binary `up` |
 
 Each binary serves `GET /metrics` on its own port (`METRICS_ADDR`): relay `:9091`, processor
-`:9092`, API `:9093`, participant `:9094`. Those ports are NOT published to the host; only
+`:9092`, API `:9093`, participant `:9094`, projector `:9095`. Those ports are NOT published to the host; only
 Prometheus reaches them, over the compose network. Every series exists because the boundary is
 asynchronous, and every label is a closed set (never an `aggregate_id` or `instruction_id`):
 
@@ -285,6 +334,7 @@ asynchronous, and every label is a closed set (never an `aggregate_id` or `instr
 | `payrouter_consumer_rebalances_total{event}` | group rebalance callbacks: `assigned`, `revoked` (drained and committed first) and `lost` (forgotten without a commit) |
 | `payrouter_participant_limit`, `..._inflight`, `..._limit_waiting`, `..._limit_changes_total{direction}` | the adaptive in-flight limit: where it is, how much of it is used, who waits for a slot, and each step up or down (absent when the limit is off) |
 | `payrouter_outbox_pending`, `..._oldest_pending_age_seconds` | relay lag at the source |
+| `payrouter_projector_events_total{result}` | what the projector did with each event: `applied`, `duplicate` (already there), `gap` (an earlier event is missing, will be retried) or `invalid` (dropped). A `gap` count that keeps growing means a missing event |
 | `payrouter_http_*{route,status}` | API traffic by route pattern; `429` and `504` side by side |
 | `payrouter_participant_payments_total`, `..._throttled_total` | the participant's own count: ground truth to compare with the processor's |
 
@@ -408,6 +458,12 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 - At-least-once delivery: the same event can appear twice in the topic after the relay
   dies. The processor discards what it has already seen by version.
 - Published outbox rows are not deleted: there is no cleanup routine yet.
+- A gap in the projection that never closes (an event that never arrives) makes the projector retry that
+  message forever and, past 1024 uncommitted messages, pause that partition. There is no alert and no
+  dead-letter queue yet.
+- The projector registers the processor's metric set for its consumer, so a few processor series
+  exist at zero in its `/metrics`; a consumer-only set comes with session 26.
+- There is no list endpoint, no cache and no replay on top of the projection yet (sessions 23 and 24).
 - Token without refresh and without revocation before it expires; no rate limit on `/auth/token`.
 - No TLS: meant to run behind a proxy or only on a local network.
 - The Postgres development secrets are in `docker-compose.yml`; do not use them outside the

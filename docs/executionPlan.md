@@ -196,7 +196,7 @@ and it is the best short answer the project gives you.
 
 | Session | Deliverable |
 |---|---|
-| 21 | `cmd/projector`: Kafka consumer, Mongo projection, idempotency by `version` |
+| 21 | `cmd/projector`: Kafka consumer, Mongo projection, idempotency by `version`. Done: the projector reads the topic in its own group and keeps one Mongo document per instruction. Version 1 is an insert decided by the unique `_id`; version v is an update filtered by version v-1, so the same event twice changes nothing and an early event is a gap that the consumer retries in place. The event-to-fields table is the projector's own (it cannot read prior state) and a cross-check test replays real domain histories and requires the same status and attempts as `domain.Rehydrate` at every prefix. `app.Message` carries the record body; invalid records are logged, counted and dropped. Compose gains `mongo` and `projector`, Prometheus scrapes `:9095`. Live: projector stopped mid-burst and restarted, Mongo `settled` equal to Postgres (400), no document with `attempts` different from 1 |
 | 22 | Tests for redelivery of the same event and for an out-of-order event |
 | 23 | Redis: status cache with version; `GET /instructions?status=...` through the projection |
 | 24 | Full replay: a command that discards the projection and rebuilds it from the event store |
