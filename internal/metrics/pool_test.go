@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestEstadoDoPoolELidoNaColeta(t *testing.T) {
@@ -79,5 +80,21 @@ func TestRebalancesSaoContadosPorEvento(t *testing.T) {
 		if got := value(t, reg, "payrouter_consumer_rebalances_total", map[string]string{"event": event}); got != want {
 			t.Errorf("rebalances{%s} = %v, esperado %v", event, got, want)
 		}
+	}
+}
+
+func TestProjetorContaEventosPorResultado(t *testing.T) {
+	reg := NewRegistry()
+	m := NewProjector(reg)
+	m.Event("applied")
+	m.Event("applied")
+	m.Event("gap")
+	(*Projector)(nil).Event("applied") // receptor nulo não pode panicar
+
+	if got := testutil.ToFloat64(m.events.WithLabelValues("applied")); got != 2 {
+		t.Errorf("applied = %v, esperado 2", got)
+	}
+	if got := testutil.ToFloat64(m.events.WithLabelValues("gap")); got != 1 {
+		t.Errorf("gap = %v, esperado 1", got)
 	}
 }
