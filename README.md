@@ -53,7 +53,7 @@ from happening, and a per-client input limit protects the API (session 17). Ever
 exposes Prometheus metrics, and the compose brings up Prometheus and one Grafana dashboard, so
 the 429-versus-timeout difference is something you can watch (session 17b). Phase E has started:
 a projector reads the same topic and keeps one Mongo document per instruction, idempotent by
-version (session 21); the list endpoint, the cache and the replay are still to come. The full plan is in
+version, and it survives the same event twice and events out of order (sessions 21 and 22); the list endpoint, the cache and the replay are still to come. The full plan is in
 [`docs/executionPlan.md`](docs/executionPlan.md).
 
 ## Up and running in five minutes
@@ -280,10 +280,22 @@ only the read side goes stale.
   `_id` decides a race between two deliveries. Version v updates only a document that is exactly at
   version v-1 (the filter is part of the update, so there is no read-then-write). The same event twice
   changes nothing and does not add an attempt; 16 concurrent deliveries of one version apply once.
-- **An early event waits, it is never dropped.** If the document is behind version v-1 the store says
-  gap, the use case returns `ErrGap` and the consumer repeats the same message in place, the same
-  backpressure the processor uses. Because Kafka partitions by `aggregate_id`, a gap only means an
-  earlier event has not been processed yet.
+- **An early event is kept in the document, never retried and never dropped.** If the document is behind
+  version v-1, the event is stored under `pending.<version>` and acknowledged, so the offset advances.
+  When the event before it is applied, the store applies the kept ones in a chain. Retrying in place would
+  not work: the retry runs inside the pool task, which holds the aggregate key, so the missing event
+  would wait behind it for ever (session 21 had exactly that defect; session 22 found it with a test).
+  The write that keeps an event is conditional on the document still being behind v-1, so the event
+  before it either lands first (and the retry of the early one re-evaluates) or finds the kept event in
+  the document it just wrote and applies it. A document born only to hold pending has `version: 0` and
+  no status. An event more than 256 versions ahead is refused as invalid, so a corrupt record cannot
+  grow `pending` without limit.
+- **What happens when the same event arrives twice?** Its version is not the next one, so nothing is
+  written and it is counted as `duplicate` (a repeat also applies any kept event a failed chain left
+  behind). The attempts are not added twice: the `$inc` only runs inside the update guarded by the version.
+- **What happens when two events arrive out of order?** The later one is kept, the earlier one applies
+  and brings it along. Every one of the 120 orders of a five-event history ends in the same document,
+  with or without repeated deliveries, and also with every event delivered once and all at the same time.
 - **A bad record cannot stall the group.** Broken JSON, an unknown event type, or a body that disagrees
   with the key and headers is logged, counted as `invalid` and skipped, so the commit watermark moves on.
 - **Money stays in cents** (`int64`, exact even above 2^53), and the stored time is the event's
@@ -334,7 +346,7 @@ asynchronous, and every label is a closed set (never an `aggregate_id` or `instr
 | `payrouter_consumer_rebalances_total{event}` | group rebalance callbacks: `assigned`, `revoked` (drained and committed first) and `lost` (forgotten without a commit) |
 | `payrouter_participant_limit`, `..._inflight`, `..._limit_waiting`, `..._limit_changes_total{direction}` | the adaptive in-flight limit: where it is, how much of it is used, who waits for a slot, and each step up or down (absent when the limit is off) |
 | `payrouter_outbox_pending`, `..._oldest_pending_age_seconds` | relay lag at the source |
-| `payrouter_projector_events_total{result}` | what the projector did with each event: `applied`, `duplicate` (already there), `gap` (an earlier event is missing, will be retried) or `invalid` (dropped). A `gap` count that keeps growing means a missing event |
+| `payrouter_projector_events_total{result}` | what the projector did with each event: `applied`, `duplicate` (already there), `buffered` (arrived early, kept in the document), `drained` (applied from the kept ones) or `invalid` (dropped). `buffered` minus `drained` is what still waits for an earlier event |
 | `payrouter_http_*{route,status}` | API traffic by route pattern; `429` and `504` side by side |
 | `payrouter_participant_payments_total`, `..._throttled_total` | the participant's own count: ground truth to compare with the processor's |
 
@@ -458,12 +470,14 @@ result as the `504`: retry with the same `Idempotency-Key`. A second signal kill
 - At-least-once delivery: the same event can appear twice in the topic after the relay
   dies. The processor discards what it has already seen by version.
 - Published outbox rows are not deleted: there is no cleanup routine yet.
-- A gap in the projection that never closes (an event that never arrives) makes the projector retry that
-  message forever and, past 1024 uncommitted messages, pause that partition. There is no alert and no
-  dead-letter queue yet.
+- An event kept in the document waits for ever if the one before it never arrives (only visible as
+  `buffered` minus `drained`): no alert, no expiry, no dead-letter queue. A full replay (session 24)
+  rebuilds the document and clears it. The list endpoint (session 23) must ignore documents with
+  `version: 0`, which only hold kept events.
 - The projector registers the processor's metric set for its consumer, so a few processor series
   exist at zero in its `/metrics`; a consumer-only set comes with session 26.
 - There is no list endpoint, no cache and no replay on top of the projection yet (sessions 23 and 24).
+- The last kept event leaves an empty `pending: {}` in the document; harmless, not worth a second write.
 - Token without refresh and without revocation before it expires; no rate limit on `/auth/token`.
 - No TLS: meant to run behind a proxy or only on a local network.
 - The Postgres development secrets are in `docker-compose.yml`; do not use them outside the
