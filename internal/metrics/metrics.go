@@ -325,7 +325,7 @@ func NewProjector(reg *prometheus.Registry) *Projector {
 	m := &Projector{
 		events: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "projector_events_total",
-			Help: "Eventos que o projetor tratou, por resultado: applied, duplicate (já aplicado), gap (falta um evento anterior, será repetido) ou invalid (descartado).",
+			Help: "Eventos que o projetor tratou, por resultado: applied, duplicate (já aplicado), buffered (chegou adiantado, guardado até o anterior), drained (aplicado a partir do guardado) ou invalid (descartado). buffered - drained é o que ainda espera um anterior.",
 		}, []string{"result"}),
 	}
 	reg.MustRegister(m.events)

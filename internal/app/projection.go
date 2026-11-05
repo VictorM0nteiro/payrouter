@@ -4,7 +4,9 @@
 // Objetivo: o lado de leitura do sistema. A projeção é uma função PURA dos eventos: cada evento
 // vira um Patch só pelo que ele mesmo carrega (tipo e dados), sem ler o estado anterior e sem
 // consultar o Postgres; o único estado do projetor é a versão do documento, e é ela que torna a
-// aplicação idempotente (o mesmo evento duas vezes não muda nada, um evento fora de ordem espera).
+// aplicação idempotente (o mesmo evento duas vezes não muda nada) e tolerante a ordem (um evento
+// adiantado é guardado no documento e aplicado quando o anterior chega, nunca repetido no consumidor,
+// onde a tarefa que repete seguraria a chave do agregado e o anterior nunca rodaria).
 // Nenhum efeito colateral mora aqui: enviar ao participante é do lado do comando.
 
 package app
@@ -25,10 +27,6 @@ var (
 	// ErrInvalidEvent: o registro não é um evento que a projeção entenda (JSON quebrado, tipo
 	// desconhecido, versão incoerente). É definitivo: repetir não ajuda, então é descartado.
 	ErrInvalidEvent = errors.New("evento inválido para a projeção")
-
-	// ErrGap: falta um evento anterior a este (a versão do documento está atrás de version-1).
-	// É transitório: o consumidor repete a mesma mensagem até o anterior chegar.
-	ErrGap = errors.New("projeção: falta um evento anterior a este")
 )
 
 // ProjectionOutcome é o que a store fez com um Patch.
@@ -37,7 +35,7 @@ type ProjectionOutcome int
 const (
 	ProjectionApplied   ProjectionOutcome = iota + 1 // gravou: o documento avançou uma versão
 	ProjectionDuplicate                              // o documento já estava nesta versão ou além
-	ProjectionGap                                    // o documento ainda não chegou à versão anterior
+	ProjectionBuffered                               // adiantado: guardado no documento até o anterior chegar
 )
 
 // Envelope é o corpo de cada registro do tópico, como o event store o grava no outbox.
@@ -137,8 +135,10 @@ func PatchFor(payload []byte) (Patch, error) {
 // ProjectionStore grava os Patches num documento por instrução.
 type ProjectionStore interface {
 	// Apply aplica o Patch se, e só se, o documento está exatamente na versão anterior (ou não
-	// existe, na versão 1). Mesma versão de novo -> Duplicate; documento atrás -> Gap.
-	Apply(ctx context.Context, p Patch) (ProjectionOutcome, error)
+	// existe, na versão 1). Mesma versão de novo -> Duplicate; documento atrás -> Buffered, e o
+	// evento é aplicado depois pelo anterior. drained conta os eventos guardados que esta chamada
+	// também aplicou (inclusive o próprio, se foi guardado e destravado na mesma chamada).
+	Apply(ctx context.Context, p Patch) (outcome ProjectionOutcome, drained int, err error)
 }
 
 // ProjectEvent é o caso de uso do projetor.
@@ -157,9 +157,9 @@ func (u *ProjectEvent) WithMetrics(m *metrics.Projector) *ProjectEvent {
 	return u
 }
 
-// Handle projeta um registro. Devolve nil quando o registro foi aplicado, já estava aplicado ou é
-// inválido (o offset avança); devolve erro, que o consumidor repete no lugar, se a store falhou ou
-// se falta um evento anterior (ErrGap).
+// Handle projeta um registro. Devolve nil quando o registro foi aplicado, já estava aplicado, ficou
+// guardado esperando o anterior ou é inválido (o offset avança sempre); devolve erro, que o consumidor
+// repete no lugar, só se a store falhou.
 func (u *ProjectEvent) Handle(ctx context.Context, msg Message) error {
 	p, err := PatchFor(msg.Payload)
 	if err == nil && (p.AggregateID != msg.AggregateID || p.Version != msg.Version) {
@@ -171,7 +171,12 @@ func (u *ProjectEvent) Handle(ctx context.Context, msg Message) error {
 		u.metrics.Event("invalid")
 		return nil
 	}
-	outcome, err := u.store.Apply(ctx, p)
+	outcome, drained, err := u.store.Apply(ctx, p)
+	if errors.Is(err, ErrInvalidEvent) { // a store recusou o evento por definitivo (longe demais do documento)
+		slog.ErrorContext(ctx, "projector: registro inválido descartado", "aggregate_id", msg.AggregateID, "version", msg.Version, "error", err)
+		u.metrics.Event("invalid")
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("projetando %s/%d: %w", p.AggregateID, p.Version, err)
 	}
@@ -180,9 +185,11 @@ func (u *ProjectEvent) Handle(ctx context.Context, msg Message) error {
 		u.metrics.Event("applied")
 	case ProjectionDuplicate:
 		u.metrics.Event("duplicate")
-	case ProjectionGap:
-		u.metrics.Event("gap")
-		return fmt.Errorf("projetando %s/%d: %w", p.AggregateID, p.Version, ErrGap)
+	case ProjectionBuffered:
+		u.metrics.Event("buffered")
+	}
+	for range drained {
+		u.metrics.Event("drained")
 	}
 	return nil
 }
