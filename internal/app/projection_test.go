@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/VictorM0nteiro/payrouter/internal/domain"
+	"github.com/VictorM0nteiro/payrouter/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 var t0 = time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
@@ -203,21 +205,42 @@ func TestProjecaoDaOMesmoStatusQueODominioEmTodoPrefixoDeTodoCaminho(t *testing.
 // fakeProjection devolve o que o teste mandar e guarda os patches recebidos.
 type fakeProjection struct {
 	outcome ProjectionOutcome
+	drained int
 	err     error
 	got     []Patch
 }
 
-func (f *fakeProjection) Apply(_ context.Context, p Patch) (ProjectionOutcome, error) {
+func (f *fakeProjection) Apply(_ context.Context, p Patch) (ProjectionOutcome, int, error) {
 	f.got = append(f.got, p)
-	return f.outcome, f.err
+	return f.outcome, f.drained, f.err
+}
+
+// counter lê projector_events_total{result} do registro.
+func counter(t *testing.T, reg *prometheus.Registry, result string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != "payrouter_projector_events_total" {
+			continue
+		}
+		for _, m := range fam.GetMetric() {
+			if m.GetLabel()[0].GetValue() == result {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
 }
 
 func msg(version int, eventType, data string) Message {
 	return Message{AggregateID: "i-1", EventType: eventType, Version: version, Payload: raw(version, eventType, data)}
 }
 
-func TestProjectEventAplicadoEDuplicadoAvancamOOffset(t *testing.T) {
-	for _, outcome := range []ProjectionOutcome{ProjectionApplied, ProjectionDuplicate} {
+func TestProjectEventAplicadoDuplicadoEGuardadoAvancamOOffset(t *testing.T) {
+	for _, outcome := range []ProjectionOutcome{ProjectionApplied, ProjectionDuplicate, ProjectionBuffered} {
 		store := &fakeProjection{outcome: outcome}
 		err := NewProjectEvent(store).Handle(context.Background(), msg(2, "RoutingAttempted", `{}`))
 		if err != nil {
@@ -229,24 +252,48 @@ func TestProjectEventAplicadoEDuplicadoAvancamOOffset(t *testing.T) {
 	}
 }
 
-func TestProjectEventComBuracoDevolveErroParaOConsumidorRepetir(t *testing.T) {
-	store := &fakeProjection{outcome: ProjectionGap}
+// Um evento adiantado NÃO pode virar erro: o consumidor repetiria a mensagem dentro da tarefa que segura a
+// chave do agregado, e o evento anterior, na fila da mesma chave, nunca rodaria.
+func TestProjectEventAdiantadoNaoVirErroParaNaoSegurarAChave(t *testing.T) {
+	store := &fakeProjection{outcome: ProjectionBuffered}
 
 	err := NewProjectEvent(store).Handle(context.Background(), msg(3, "ParticipantAccepted", `{}`))
 
-	if !errors.Is(err, ErrGap) {
-		t.Errorf("erro = %v, esperado ErrGap: a mensagem tem de ser repetida, não descartada", err)
+	if err != nil {
+		t.Errorf("erro = %v, esperado nil: o evento fica guardado no documento e o offset avança", err)
 	}
 }
 
-func TestProjectEventErroDaStoreEhTransitorioENaoViraGap(t *testing.T) {
+func TestProjectEventContaCadaResultadoEOsDrenados(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.NewProjector(reg)
+	run := func(outcome ProjectionOutcome, drained int) {
+		store := &fakeProjection{outcome: outcome, drained: drained}
+		if err := NewProjectEvent(store).WithMetrics(m).Handle(context.Background(), msg(2, "RoutingAttempted", `{}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(ProjectionApplied, 0)
+	run(ProjectionBuffered, 0)
+	run(ProjectionBuffered, 0)
+	run(ProjectionApplied, 2) // o anterior chegou e destravou dois guardados
+	run(ProjectionDuplicate, 0)
+
+	for result, want := range map[string]float64{"applied": 2, "buffered": 2, "drained": 2, "duplicate": 1} {
+		if got := counter(t, reg, result); got != want {
+			t.Errorf("%s = %v, esperado %v", result, got, want)
+		}
+	}
+}
+
+func TestProjectEventErroDaStoreVoltaParaOConsumidorRepetir(t *testing.T) {
 	boom := errors.New("mongo fora do ar")
 	store := &fakeProjection{err: boom}
 
 	err := NewProjectEvent(store).Handle(context.Background(), msg(2, "RoutingAttempted", `{}`))
 
-	if !errors.Is(err, boom) || errors.Is(err, ErrGap) {
-		t.Errorf("erro = %v, esperado o erro da store, sem ser ErrGap", err)
+	if !errors.Is(err, boom) {
+		t.Errorf("erro = %v, esperado o erro da store (o consumidor repete)", err)
 	}
 }
 
@@ -269,5 +316,21 @@ func TestProjectEventDescartaORegistroInvalidoSemTocarNaStore(t *testing.T) {
 				t.Errorf("a store recebeu %d patches de um registro inválido", len(store.got))
 			}
 		})
+	}
+}
+
+// Se a store recusa o evento como definitivamente inválido, repetir não ajuda e, pior, seguraria a chave
+// do agregado: o registro é descartado e contado, como qualquer outro inválido.
+func TestProjectEventRecusadoPelaStoreComoInvalidoNaoEhRepetido(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	store := &fakeProjection{err: fmt.Errorf("%w: longe demais", ErrInvalidEvent)}
+
+	err := NewProjectEvent(store).WithMetrics(metrics.NewProjector(reg)).Handle(context.Background(), msg(2, "RoutingAttempted", `{}`))
+
+	if err != nil {
+		t.Errorf("erro = %v, esperado nil", err)
+	}
+	if got := counter(t, reg, "invalid"); got != 1 {
+		t.Errorf("invalid = %v, esperado 1", got)
 	}
 }
